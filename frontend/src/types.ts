@@ -122,6 +122,7 @@ export interface OpsOverviewResponse {
     percent: number
     used_bytes: number
     total_bytes: number
+    process_bytes?: number
   }
   runtime: {
     goroutines: number

@@ -1090,7 +1090,7 @@ pub async fn ops_overview(
     let error_rate = usage.as_ref().map(|u| u.error_rate).unwrap_or(0.0);
 
     // CPU & 内存
-    let (cpu_percent, mem_percent, mem_used, mem_total) = get_sys_metrics();
+    let (cpu_percent, mem_percent, mem_used, mem_total, process_mem) = get_sys_metrics();
 
     // PostgreSQL 连接池
     let pool_size = state.db.size() as i64;
@@ -1114,7 +1114,7 @@ pub async fn ops_overview(
         "cache_driver": "memory",
         "cache_label": "in-process",
         "cpu": { "percent": cpu_percent, "cores": num_cpus() },
-        "memory": { "percent": mem_percent, "used_bytes": mem_used, "total_bytes": mem_total },
+        "memory": { "percent": mem_percent, "used_bytes": mem_used, "total_bytes": mem_total, "process_bytes": process_mem },
         "runtime": {
             "goroutines": tokio::runtime::Handle::current().metrics().num_alive_tasks(),
             "available_accounts": state.scheduler.available_count(),
@@ -1149,8 +1149,8 @@ pub async fn ops_overview(
 }
 
 /// 获取 CPU 和内存指标
-fn get_sys_metrics() -> (f64, f64, u64, u64) {
-    use sysinfo::System;
+fn get_sys_metrics() -> (f64, f64, u64, u64, u64) {
+    use sysinfo::{Pid, ProcessesToUpdate, System};
     let mut sys = System::new();
     sys.refresh_memory();
     sys.refresh_cpu_usage();
@@ -1165,7 +1165,12 @@ fn get_sys_metrics() -> (f64, f64, u64, u64) {
 
     let cpu_percent = sys.global_cpu_usage() as f64;
 
-    (cpu_percent, mem_percent, mem_used, mem_total)
+    // 获取本进程内存占用（RSS）
+    let pid = Pid::from_u32(std::process::id());
+    sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), false);
+    let process_mem = sys.process(pid).map(|p| p.memory()).unwrap_or(0);
+
+    (cpu_percent, mem_percent, mem_used, mem_total, process_mem)
 }
 
 fn num_cpus() -> usize {

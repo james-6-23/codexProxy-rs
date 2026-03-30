@@ -235,6 +235,7 @@ pub async fn add_account(
 
                     let email_out = account.email.read().clone();
                     state.scheduler.add_account(account);
+                    queries::insert_account_event(&state.db, id, "added", "manual").await;
 
                     (
                         StatusCode::CREATED,
@@ -368,6 +369,7 @@ pub async fn add_at_account(
                     *account.codex_account_id.write() = info.chatgpt_account_id;
                     *account.expires_at.write() = expires_at;
                     state.scheduler.add_account(account);
+                    queries::insert_account_event(&state.db, id, "added", "at").await;
                     success_count.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(e) => {
@@ -502,6 +504,7 @@ pub async fn delete_account(
     }
 
     state.scheduler.remove_account(id);
+    queries::insert_account_event(&state.db, id, "deleted", "manual").await;
     Json(json!({"message": "ok"})).into_response()
 }
 
@@ -522,6 +525,7 @@ pub async fn batch_delete_accounts(
         }
         for id in &req.ids {
             state.scheduler.remove_account(*id);
+            queries::insert_account_event(&state.db, *id, "deleted", "batch").await;
         }
     }
 
@@ -1028,7 +1032,10 @@ pub async fn ops_overview(
     let pool_size = state.db.size() as i64;
     let pool_idle = state.db.num_idle() as i64;
     let pool_in_use = pool_size - pool_idle;
-    let pool_max = state.config.db_pool_size as i64;
+    let pool_max = {
+        let s = state.db_settings_cache.read().unwrap();
+        if s.pg_max_conns > 0 { s.pg_max_conns as i64 } else { state.config.db_pool_size as i64 }
+    };
     let pg_usage = if pool_max > 0 { pool_in_use as f64 / pool_max as f64 * 100.0 } else { 0.0 };
 
     // in-process 缓存（内存缓存，始终健康）
@@ -1355,6 +1362,7 @@ pub async fn clean_banned(
         if acc.health_tier.load(Ordering::Relaxed) == scheduler::TIER_BANNED {
             let _ = queries::delete_account(&state.db, acc.db_id).await;
             state.scheduler.remove_account(acc.db_id);
+            queries::insert_account_event(&state.db, acc.db_id, "deleted", "clean_banned").await;
             cleaned += 1;
         }
     }
@@ -1376,6 +1384,7 @@ pub async fn clean_rate_limited(
         if acc.is_in_cooldown() {
             let _ = queries::delete_account(&state.db, acc.db_id).await;
             state.scheduler.remove_account(acc.db_id);
+            queries::insert_account_event(&state.db, acc.db_id, "deleted", "clean_rate_limited").await;
             cleaned += 1;
         }
     }
@@ -1398,6 +1407,7 @@ pub async fn clean_error(
         if tier == scheduler::TIER_BANNED || tier == scheduler::TIER_RISKY {
             let _ = queries::delete_account(&state.db, acc.db_id).await;
             state.scheduler.remove_account(acc.db_id);
+            queries::insert_account_event(&state.db, acc.db_id, "deleted", "clean_error").await;
             cleaned += 1;
         }
     }
@@ -1819,4 +1829,33 @@ async fn import_json(
     }
 
     import_rt_txt(state, tokens.join("\n").into_bytes(), proxy_url).await
+}
+
+// ─── 账号事件趋势 ───
+
+/// GET /api/admin/accounts/event-trend?start=...&end=...&bucket_minutes=60
+pub async fn account_event_trend(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Err(code) = verify_admin(&state, &headers) {
+        return (code, Json(json!({"error": "unauthorized"}))).into_response();
+    }
+
+    let start = params.get("start").cloned().unwrap_or_default();
+    let end = params.get("end").cloned().unwrap_or_default();
+    let bucket_minutes: i64 = params
+        .get("bucket_minutes")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+
+    match queries::get_account_event_trend(&state.db, &start, &end, bucket_minutes).await {
+        Ok(points) => Json(json!({"points": points})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
 }

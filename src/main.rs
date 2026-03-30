@@ -40,16 +40,27 @@ async fn main() {
     let config = AppConfig::from_env();
     info!(port = config.port, "启动 codex-proxy");
 
-    // 初始化数据库
-    let db_pool = db::init(&config.database_url, config.db_pool_size)
+    // 初始化数据库（先小池读配置，再按配置建正式池）
+    let boot_pool = db::init(&config.database_url, 2)
         .await
         .expect("数据库初始化失败");
 
     // 加载系统设置
-    let settings = db::queries::get_system_settings(&db_pool)
+    let settings = db::queries::get_system_settings(&boot_pool)
         .await
         .expect("加载系统设置失败");
-    info!(max_concurrency = settings.max_concurrency, global_rpm = settings.global_rpm, "系统设置已加载");
+
+    // 用 pg_max_conns 创建正式连接池
+    let pool_size = if settings.pg_max_conns > 0 { settings.pg_max_conns as u32 } else { config.db_pool_size };
+    let db_pool = if pool_size > 2 {
+        boot_pool.close().await;
+        db::init(&config.database_url, pool_size)
+            .await
+            .expect("数据库初始化失败")
+    } else {
+        boot_pool
+    };
+    info!(max_concurrency = settings.max_concurrency, global_rpm = settings.global_rpm, pg_max_conns = pool_size, "系统设置已加载");
 
     // 初始化调度器
     let scheduler = Scheduler::new(settings.max_concurrency as i64);
@@ -160,6 +171,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/admin/accounts/clean-banned", post(admin::handler::clean_banned))
         .route("/api/admin/accounts/clean-rate-limited", post(admin::handler::clean_rate_limited))
         .route("/api/admin/accounts/clean-error", post(admin::handler::clean_error))
+        .route("/api/admin/accounts/event-trend", get(admin::handler::account_event_trend))
         // 使用统计
         .route("/api/admin/usage/stats", get(admin::handler::usage_stats))
         .route("/api/admin/usage/logs", get(admin::handler::usage_logs))
@@ -518,6 +530,7 @@ async fn auto_cleanup_sweep(state: &AppState) {
         if should_clean || rate_limited_clean {
             let _ = db::queries::delete_account(&state.db, acc.db_id).await;
             state.scheduler.remove_account(acc.db_id);
+            db::queries::insert_account_event(&state.db, acc.db_id, "deleted", "auto_clean").await;
             cleaned += 1;
         }
     }
@@ -550,8 +563,8 @@ async fn auto_cleanup_full_usage(state: &AppState) {
         if usage_7d >= 10000 {
             let _ = db::queries::delete_account(&state.db, acc.db_id).await;
             state.scheduler.remove_account(acc.db_id);
+            db::queries::insert_account_event(&state.db, acc.db_id, "deleted", "clean_full_usage").await;
             cleaned += 1;
-            info!(account_id = acc.db_id, usage_pct = usage_7d as f64 / 100.0, "用量满，自动清理");
         }
     }
 
@@ -582,6 +595,7 @@ async fn auto_cleanup_expired(state: &AppState) {
         if rt.is_empty() && expires < threshold {
             let _ = db::queries::delete_account(&state.db, acc.db_id).await;
             state.scheduler.remove_account(acc.db_id);
+            db::queries::insert_account_event(&state.db, acc.db_id, "deleted", "clean_expired").await;
             cleaned += 1;
         }
     }

@@ -84,8 +84,13 @@ async fn create_tables(pool: &PgPool) -> Result<()> {
             auto_clean_error        BOOLEAN NOT NULL DEFAULT FALSE,
             auto_clean_expired      BOOLEAN NOT NULL DEFAULT FALSE,
             fast_scheduler_enabled  BOOLEAN NOT NULL DEFAULT FALSE,
-            max_retries             INT NOT NULL DEFAULT 2
+            max_retries             INT NOT NULL DEFAULT 2,
+            pg_max_conns            INT NOT NULL DEFAULT 20
         )",
+        // 兼容已有表：添加 pg_max_conns 列
+        "DO $$ BEGIN
+            ALTER TABLE system_settings ADD COLUMN pg_max_conns INT NOT NULL DEFAULT 20;
+        EXCEPTION WHEN duplicate_column THEN NULL; END $$",
         "INSERT INTO system_settings (id) VALUES (1) ON CONFLICT DO NOTHING",
         "CREATE TABLE IF NOT EXISTS usage_stats_baseline (
             id                  INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),

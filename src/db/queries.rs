@@ -261,7 +261,7 @@ pub async fn get_system_settings(pool: &DbPool) -> Result<SystemSettings> {
         "SELECT max_concurrency, global_rpm, test_model, test_concurrency,
                 proxy_url, admin_secret, auto_clean_unauthorized, auto_clean_rate_limited,
                 auto_clean_full_usage, auto_clean_error, auto_clean_expired,
-                fast_scheduler_enabled, max_retries
+                fast_scheduler_enabled, max_retries, pg_max_conns
          FROM system_settings WHERE id = 1",
     )
     .fetch_one(pool)
@@ -275,7 +275,7 @@ pub async fn update_system_settings(pool: &DbPool, s: &SystemSettings) -> Result
             max_concurrency=$1, global_rpm=$2, test_model=$3, test_concurrency=$4,
             proxy_url=$5, admin_secret=$6, auto_clean_unauthorized=$7, auto_clean_rate_limited=$8,
             auto_clean_full_usage=$9, auto_clean_error=$10, auto_clean_expired=$11,
-            fast_scheduler_enabled=$12, max_retries=$13
+            fast_scheduler_enabled=$12, max_retries=$13, pg_max_conns=$14
          WHERE id = 1",
     )
     .bind(s.max_concurrency)
@@ -291,6 +291,7 @@ pub async fn update_system_settings(pool: &DbPool, s: &SystemSettings) -> Result
     .bind(s.auto_clean_expired)
     .bind(s.fast_scheduler_enabled)
     .bind(s.max_retries)
+    .bind(s.pg_max_conns)
     .execute(pool)
     .await?;
     Ok(())
@@ -479,4 +480,54 @@ pub async fn clear_usage_logs(pool: &DbPool) -> Result<()> {
 
     sqlx::query("TRUNCATE usage_logs").execute(pool).await?;
     Ok(())
+}
+
+// ─── 账号事件 ───
+
+/// 插入账号事件（added / deleted）
+pub async fn insert_account_event(pool: &DbPool, account_id: i64, event_type: &str, source: &str) {
+    let _ = sqlx::query(
+        "INSERT INTO account_events (account_id, event_type, source) VALUES ($1, $2, $3)",
+    )
+    .bind(account_id)
+    .bind(event_type)
+    .bind(source)
+    .execute(pool)
+    .await;
+}
+
+/// 查询账号增删趋势（按时间桶聚合）
+pub async fn get_account_event_trend(
+    pool: &DbPool,
+    start: &str,
+    end: &str,
+    bucket_minutes: i64,
+) -> Result<Vec<AccountEventPoint>> {
+    let bucket_secs = bucket_minutes * 60;
+    let rows = sqlx::query_as::<_, AccountEventPoint>(
+        "SELECT
+            TO_CHAR(
+                TO_TIMESTAMP(FLOOR(EXTRACT(EPOCH FROM created_at) / $1) * $1),
+                'YYYY-MM-DD\"T\"HH24:MI:SS'
+            ) AS bucket,
+            COALESCE(SUM(CASE WHEN event_type = 'added' THEN 1 ELSE 0 END), 0)::BIGINT AS added,
+            COALESCE(SUM(CASE WHEN event_type = 'deleted' THEN 1 ELSE 0 END), 0)::BIGINT AS deleted
+         FROM account_events
+         WHERE created_at >= $2::TIMESTAMPTZ AND created_at <= $3::TIMESTAMPTZ
+         GROUP BY 1
+         ORDER BY 1",
+    )
+    .bind(bucket_secs as f64)
+    .bind(start)
+    .bind(end)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+#[derive(Debug, sqlx::FromRow, serde::Serialize)]
+pub struct AccountEventPoint {
+    pub bucket: String,
+    pub added: i64,
+    pub deleted: i64,
 }

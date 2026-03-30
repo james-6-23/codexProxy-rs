@@ -1,0 +1,164 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme {
+  --font-sans: 'Inter', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'SFMono-Regular', ui-monospace, monospace;
+  --font-geist-mono: 'Geist Mono', 'JetBrains Mono', 'Fira Code', 'SFMono-Regular', ui-monospace, monospace;
+
+  --radius-sm: 0.375rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 1rem;
+
+  /* Light theme — 纯白底 + 黑字 */
+  --color-background: hsl(0 0% 100%);
+  --color-foreground: hsl(0 0% 9%);
+  --color-card: hsl(0 0% 100%);
+  --color-card-foreground: hsl(0 0% 9%);
+  --color-popover: hsl(0 0% 100%);
+  --color-popover-foreground: hsl(0 0% 9%);
+  --color-primary: hsl(0 0% 9%);
+  --color-primary-foreground: hsl(0 0% 98%);
+  --color-secondary: hsl(0 0% 96%);
+  --color-secondary-foreground: hsl(0 0% 9%);
+  --color-muted: hsl(0 0% 96%);
+  --color-muted-foreground: hsl(0 0% 45%);
+  --color-accent: hsl(0 0% 96%);
+  --color-accent-foreground: hsl(0 0% 9%);
+  --color-destructive: hsl(0 72% 51%);
+  --color-destructive-foreground: hsl(0 0% 98%);
+  --color-border: hsl(0 0% 90%);
+  --color-input: hsl(0 0% 90%);
+  --color-ring: hsl(0 0% 9%);
+}
+
+@layer base {
+  :root {
+    --success: 142 71% 35%;
+    --success-bg: 142 71% 35% / 0.1;
+    --warning: 38 92% 50%;
+    --warning-bg: 38 92% 50% / 0.1;
+    --info: 217 91% 60%;
+    --info-bg: 217 91% 60% / 0.1;
+    --sidebar-background: 0 0% 100%;
+  }
+
+  /* ===== Dark — 纯黑底 + 白字 ===== */
+  .dark {
+    --color-background: hsl(0 0% 4%);
+    --color-foreground: hsl(0 0% 98%);
+    --color-card: hsl(0 0% 7%);
+    --color-card-foreground: hsl(0 0% 98%);
+    --color-popover: hsl(0 0% 7%);
+    --color-popover-foreground: hsl(0 0% 98%);
+    --color-primary: hsl(0 0% 98%);
+    --color-primary-foreground: hsl(0 0% 9%);
+    --color-secondary: hsl(0 0% 15%);
+    --color-secondary-foreground: hsl(0 0% 98%);
+    --color-muted: hsl(0 0% 15%);
+    --color-muted-foreground: hsl(0 0% 64%);
+    --color-accent: hsl(0 0% 15%);
+    --color-accent-foreground: hsl(0 0% 98%);
+    --color-destructive: hsl(0 62% 50%);
+    --color-destructive-foreground: hsl(0 0% 98%);
+    --color-border: hsl(0 0% 18%);
+    --color-input: hsl(0 0% 18%);
+    --color-ring: hsl(0 0% 83%);
+
+    --success: 142 71% 45%;
+    --success-bg: 142 71% 45% / 0.12;
+    --warning: 38 92% 55%;
+    --warning-bg: 38 92% 55% / 0.12;
+    --info: 217 91% 65%;
+    --info-bg: 217 91% 65% / 0.12;
+    --sidebar-background: 0 0% 4%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-family: var(--font-sans);
+    min-height: 100vh;
+    background: hsl(0 0% 100%);
+  }
+
+  .dark body,
+  body.dark {
+    background: hsl(0 0% 4%);
+  }
+}
+
+/* 主题切换过渡 */
+.theme-transition,
+.theme-transition *,
+.theme-transition *::before,
+.theme-transition *::after {
+  transition: background-color 0.4s ease, color 0.3s ease, border-color 0.35s ease,
+              box-shadow 0.35s ease, background 0.4s ease, fill 0.3s ease, stroke 0.3s ease !important;
+}
+
+/* Toast animation */
+@keyframes toast-slide-in {
+  from {
+    opacity: 0;
+    transform: translateY(-12px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* Spinner */
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.spinner {
+  width: 2rem;
+  height: 2rem;
+  border: 3px solid var(--color-border);
+  border-top-color: var(--color-foreground);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+/* ===== Dark mode overrides for hardcoded bg-white ===== */
+.dark .bg-white\/40,
+.dark .bg-white\/50,
+.dark .bg-white\/55,
+.dark .bg-white\/60,
+.dark .bg-white\/65,
+.dark .bg-white\/70,
+.dark .bg-white\/80,
+.dark .bg-white\/90 {
+  background-color: hsl(0 0% 10% / 0.6) !important;
+}
+
+.dark .bg-white {
+  background-color: hsl(0 0% 10%) !important;
+}
+
+/* Dark mode table styling */
+.dark tr:hover {
+  background-color: hsl(0 0% 12% / 0.5);
+}
+
+/* Dark mode input styling */
+.dark input,
+.dark textarea,
+.dark select {
+  background-color: hsl(0 0% 7%);
+  color: hsl(0 0% 98%);
+  border-color: hsl(0 0% 18%);
+}
+
+/* Dark mode shadow softening */
+.dark [class*="shadow-"] {
+  --tw-shadow-color: hsl(0 0% 0% / 0.4);
+}

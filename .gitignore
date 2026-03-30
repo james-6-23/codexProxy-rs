@@ -1,2 +1,26 @@
+# Rust 构建产物
 /target
+
+# Go 原版（参考用，不纳入版本管理）
+/codex2api
+
+# 前端依赖 & 构建产物（按需重新生成）
+frontend/node_modules/
+frontend/dist/
+
+# 环境
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 数据
 /data
+*.db

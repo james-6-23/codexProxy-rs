@@ -9,8 +9,7 @@ codex2api/
 target/
 
 # 前端依赖（Docker 内重新安装）
-codex2api/frontend/node_modules/
-codex2api/frontend/dist/
+frontend/node_modules/
 frontend/dist/
 
 # IDE

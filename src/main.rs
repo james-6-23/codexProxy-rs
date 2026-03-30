@@ -65,6 +65,7 @@ async fn main() {
         *account.email.write() = creds.email;
         *account.plan_type.write() = creds.plan_type;
         *account.proxy_url.write() = row.proxy_url;
+        *account.codex_account_id.write() = creds.account_id;
         *account.access_token.write() = creds.access_token;
         *account.refresh_token.write() = creds.refresh_token;
 

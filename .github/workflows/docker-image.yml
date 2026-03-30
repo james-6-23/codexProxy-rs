@@ -1,9 +1,11 @@
-name: Build Docker Image
+name: Build & Push Docker Image
 
 on:
   push:
     tags:
       - 'v*'
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -11,12 +13,12 @@ permissions:
   packages: write
 
 concurrency:
-  group: docker-image-${{ github.ref }}
+  group: docker-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  IMAGE_NAME: james-6-23/codex-proxy
 
 jobs:
   docker:
@@ -46,9 +48,10 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=,enable=${{ github.ref_type != 'tag' }}
 
-      - name: Build and push Docker image
+      - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .

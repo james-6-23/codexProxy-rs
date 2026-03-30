@@ -48,16 +48,10 @@ jobs:
           node-version: 20
 
       - name: Build frontend
-        working-directory: codex2api/frontend
+        working-directory: frontend
         run: |
           npm ci --no-audit --no-fund
           npm run build
-
-      - name: Copy frontend dist
-        shell: bash
-        run: |
-          mkdir -p frontend/dist
-          cp -r codex2api/frontend/dist/* frontend/dist/
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

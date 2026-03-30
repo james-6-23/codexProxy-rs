@@ -34,7 +34,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # 工具
 chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v5"] }
 rand = "0.9"
 dashmap = "6"
 base64 = "0.22"

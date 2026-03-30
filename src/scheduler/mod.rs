@@ -35,6 +35,8 @@ pub struct Account {
     pub email: RwLock<String>,
     pub plan_type: RwLock<String>,
     pub proxy_url: RwLock<String>,
+    /// Codex 真实 account_id（来自 credentials.account_id）
+    pub codex_account_id: RwLock<String>,
 
     // Token（冷路径，只在刷新时写入）
     pub access_token: RwLock<String>,
@@ -119,6 +121,7 @@ impl Account {
             email: RwLock::new(String::new()),
             plan_type: RwLock::new(String::new()),
             proxy_url: RwLock::new(String::new()),
+            codex_account_id: RwLock::new(String::new()),
             access_token: RwLock::new(String::new()),
             refresh_token: RwLock::new(String::new()),
             expires_at: RwLock::new(Utc::now()),

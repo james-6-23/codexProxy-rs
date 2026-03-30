@@ -93,13 +93,17 @@
   }
 }
 
-/* 主题切换过渡 */
-.theme-transition,
-.theme-transition *,
-.theme-transition *::before,
-.theme-transition *::after {
-  transition: background-color 0.4s ease, color 0.3s ease, border-color 0.35s ease,
-              box-shadow 0.35s ease, background 0.4s ease, fill 0.3s ease, stroke 0.3s ease !important;
+/* 主题切换 — View Transition 圆形扩散动画 */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation: none;
+  mix-blend-mode: normal;
+}
+::view-transition-old(root) {
+  z-index: 1;
+}
+::view-transition-new(root) {
+  z-index: 9999;
 }
 
 /* Toast animation */

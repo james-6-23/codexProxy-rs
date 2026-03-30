@@ -29,9 +29,9 @@ export default function Layout({ children }: PropsWithChildren) {
   const { hasUpdate, latestVersion } = useVersionCheck()
   const [spinning, setSpinning] = useState(false)
 
-  const handleThemeToggle = () => {
+  const handleThemeToggle = (e: React.MouseEvent) => {
     setSpinning(true)
-    toggle()
+    toggle(e)
     setTimeout(() => setSpinning(false), 500)
   }
 

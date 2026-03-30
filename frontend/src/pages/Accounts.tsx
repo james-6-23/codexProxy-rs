@@ -500,17 +500,12 @@ export default function Accounts() {
     })
     if (!confirmed) return
     setBatchLoading(true)
-    let success = 0
-    let fail = 0
-    for (const id of selected) {
-      try {
-        await api.deleteAccount(id)
-        success++
-      } catch {
-        fail++
-      }
+    try {
+      const res = await api.batchDeleteAccounts(Array.from(selected))
+      showToast(t('accounts.batchDeleteDone', { success: res.deleted, fail: 0 }))
+    } catch (error) {
+      showToast(t('accounts.deleteFailed', { error: getErrorMessage(error) }), 'error')
     }
-    showToast(t('accounts.batchDeleteDone', { success, fail }))
     setSelected(new Set())
     setBatchLoading(false)
     void reload()

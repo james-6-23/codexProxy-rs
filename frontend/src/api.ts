@@ -101,6 +101,8 @@ export const api = {
     request<CreateAccountResponse>('/accounts/at', { method: 'POST', body: JSON.stringify(data) }),
   deleteAccount: (id: number) =>
     request<MessageResponse>(`/accounts/${id}`, { method: 'DELETE' }),
+  batchDeleteAccounts: (ids: number[]) =>
+    request<{ message: string; deleted: number }>('/accounts/batch-delete', { method: 'POST', body: JSON.stringify({ ids }) }),
   refreshAccount: (id: number) =>
     request<MessageResponse>(`/accounts/${id}/refresh`, { method: 'POST' }),
   getAccountUsage: (id: number) =>

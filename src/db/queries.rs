@@ -10,7 +10,9 @@ pub async fn list_active_accounts(pool: &DbPool) -> Result<Vec<AccountRow>> {
     let rows = sqlx::query_as::<_, AccountRow>(
         "SELECT id, name, platform, type, credentials::TEXT, proxy_url, status,
                 error_message, cooldown_reason,
-                cooldown_until::TEXT, created_at::TEXT, updated_at::TEXT
+                cooldown_until::TEXT,
+                TO_CHAR(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at,
+                TO_CHAR(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at
          FROM accounts WHERE status = 'active' ORDER BY id",
     )
     .fetch_all(pool)
@@ -27,6 +29,55 @@ pub async fn insert_account(pool: &DbPool, name: &str, creds: &Credentials, prox
         .fetch_one(pool)
         .await?;
     Ok(row.get::<i64, _>("id"))
+}
+
+/// 插入 AT-only 账号（type='at'，无 refresh_token）
+pub async fn insert_at_account(pool: &DbPool, name: &str, creds: &Credentials, proxy_url: &str) -> Result<i64> {
+    let creds_json = serde_json::to_value(creds)?;
+    let row = sqlx::query(
+        "INSERT INTO accounts (name, type, credentials, proxy_url) VALUES ($1, 'at', $2, $3) RETURNING id",
+    )
+    .bind(name)
+    .bind(creds_json)
+    .bind(proxy_url)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.get::<i64, _>("id"))
+}
+
+/// 获取所有已有的 access_token（用于 AT 导入去重）
+pub async fn get_all_access_tokens(pool: &DbPool) -> Result<std::collections::HashSet<String>> {
+    let rows = sqlx::query_scalar::<_, String>(
+        "SELECT credentials->>'access_token' FROM accounts WHERE status != 'deleted' AND credentials->>'access_token' != ''",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// 获取所有已有的 refresh_token（用于 RT 导入去重）
+pub async fn get_all_refresh_tokens(pool: &DbPool) -> Result<std::collections::HashSet<String>> {
+    let rows = sqlx::query_scalar::<_, String>(
+        "SELECT credentials->>'refresh_token' FROM accounts WHERE status != 'deleted' AND credentials->>'refresh_token' != ''",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// 批量软删除账号，返回实际影响行数
+pub async fn batch_delete_accounts(pool: &DbPool, ids: &[i64]) -> Result<i64> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    // 构建 ANY($1) 参数
+    let result = sqlx::query(
+        "UPDATE accounts SET status = 'deleted', updated_at = NOW() WHERE id = ANY($1) AND status != 'deleted'",
+    )
+    .bind(ids)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() as i64)
 }
 
 pub async fn update_account_credentials(pool: &DbPool, id: i64, creds: &Credentials) -> Result<()> {

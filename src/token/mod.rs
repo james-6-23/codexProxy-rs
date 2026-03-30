@@ -26,9 +26,11 @@ pub struct AccountInfo {
     pub email: String,
     pub chatgpt_account_id: String,
     pub chatgpt_plan_type: String,
+    /// JWT exp 字段（unix timestamp），0 表示未解析到
+    pub expires_at: i64,
 }
 
-/// 解析 JWT payload（不验证签名）
+/// 解析 JWT payload（不验证签名），兼容 id_token 和 access_token 两种格式
 pub fn parse_id_token(id_token: &str) -> Option<AccountInfo> {
     let parts: Vec<&str> = id_token.split('.').collect();
     if parts.len() < 2 {
@@ -44,21 +46,25 @@ pub fn parse_id_token(id_token: &str) -> Option<AccountInfo> {
     Some(AccountInfo {
         email: json
             .get("email")
-            .or_else(|| json.pointer("/https://api.openai.com/profile/email"))
+            .or_else(|| json.pointer("/https:~1~1api.openai.com~1profile/email"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
         chatgpt_account_id: json
             .get("chatgpt_account_id")
-            .or_else(|| json.pointer("/https://api.openai.com/auth/chatgpt_account_id"))
+            .or_else(|| json.pointer("/https:~1~1api.openai.com~1auth/chatgpt_account_id"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
         chatgpt_plan_type: json
             .get("chatgpt_plan_type")
-            .or_else(|| json.pointer("/https://api.openai.com/auth/chatgpt_plan_type"))
+            .or_else(|| json.pointer("/https:~1~1api.openai.com~1auth/chatgpt_plan_type"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
+        expires_at: json
+            .get("exp")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0),
     })
 }

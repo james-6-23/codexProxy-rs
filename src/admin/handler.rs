@@ -5,6 +5,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
+use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -103,6 +104,11 @@ pub async fn list_accounts(
         return (code, Json(json!({"error": "unauthorized"}))).into_response();
     }
 
+    // 从数据库读取真实的时间字段
+    let db_rows = queries::list_active_accounts(&state.db).await.unwrap_or_default();
+    let db_map: std::collections::HashMap<i64, &crate::db::models::AccountRow> =
+        db_rows.iter().map(|r| (r.id, r)).collect();
+
     let accounts = state.scheduler.all_accounts();
     let now = chrono::Utc::now().timestamp();
     let mut result = Vec::new();
@@ -122,7 +128,6 @@ pub async fn list_accounts(
         let cooldown = acc.cooldown_until.load(Ordering::Relaxed);
         let rt_empty = acc.refresh_token.read().is_empty();
 
-        // 计算 scheduler_breakdown
         let last_401 = acc.last_unauthorized_at.load(Ordering::Relaxed);
         let last_429 = acc.last_rate_limited_at.load(Ordering::Relaxed);
         let last_timeout = acc.last_timeout_at.load(Ordering::Relaxed);
@@ -130,7 +135,6 @@ pub async fn list_accounts(
         let fail_streak = acc.failure_streak.load(Ordering::Relaxed);
         let success_streak = acc.success_streak.load(Ordering::Relaxed);
 
-        // 衰减计算（与 scorer.rs 一致）
         let unauthorized_penalty = if last_401 > 0 {
             50.0 * (1.0 - (now - last_401) as f64 / 86400.0).max(0.0)
         } else {
@@ -172,7 +176,6 @@ pub async fn list_accounts(
             0.0
         };
 
-        // 状态映射（前端期望的 status 字段）
         let status = if tier == scheduler::TIER_BANNED {
             "error"
         } else if acc.is_in_cooldown() {
@@ -185,6 +188,11 @@ pub async fn list_accounts(
         let error_requests = total - success_requests;
 
         let last_success = acc.last_success_at.load(Ordering::Relaxed);
+
+        // 从数据库读取真实的创建/更新时间
+        let db_row = db_map.get(&acc.db_id);
+        let created_at = db_row.map(|r| &r.created_at);
+        let updated_at = db_row.map(|r| &r.updated_at);
 
         result.push(json!({
             "id": acc.db_id,
@@ -218,10 +226,8 @@ pub async fn list_accounts(
             "last_rate_limited_at": ts_to_rfc3339(last_429),
             "last_timeout_at": ts_to_rfc3339(last_timeout),
             "last_server_error_at": ts_to_rfc3339(last_5xx),
-            "created_at": chrono::DateTime::from_timestamp(
-                acc.created_at.elapsed().as_secs() as i64, 0
-            ).map(|dt| dt.to_rfc3339()),
-            "updated_at": chrono::Utc::now().to_rfc3339(),
+            "created_at": created_at,
+            "updated_at": updated_at,
         }));
     }
 
@@ -340,11 +346,20 @@ pub async fn add_at_account(
 
     let info = token::parse_id_token(&req.access_token).unwrap_or_default();
 
+    // 从 JWT 解析过期时间，默认 1 小时
+    let expires_at = if info.expires_at > 0 {
+        chrono::DateTime::from_timestamp(info.expires_at, 0)
+            .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::hours(1))
+    } else {
+        chrono::Utc::now() + chrono::Duration::hours(1)
+    };
+
     let creds = Credentials {
         access_token: req.access_token.clone(),
         email: info.email.clone(),
         account_id: info.chatgpt_account_id.clone(),
         plan_type: info.chatgpt_plan_type.clone(),
+        expires_at: expires_at.to_rfc3339(),
         ..Default::default()
     };
 
@@ -358,13 +373,15 @@ pub async fn add_at_account(
         req.name
     };
 
-    match queries::insert_account(&state.db, &name, &creds, &req.proxy_url).await {
+    match queries::insert_at_account(&state.db, &name, &creds, &req.proxy_url).await {
         Ok(id) => {
             let account = Arc::new(Account::new(id));
             *account.email.write() = info.email;
             *account.plan_type.write() = info.chatgpt_plan_type;
             *account.proxy_url.write() = req.proxy_url;
             *account.access_token.write() = req.access_token;
+            *account.codex_account_id.write() = info.chatgpt_account_id;
+            *account.expires_at.write() = expires_at;
             state.scheduler.add_account(account);
 
             (
@@ -486,6 +503,34 @@ pub async fn delete_account(
 
     state.scheduler.remove_account(id);
     Json(json!({"message": "ok"})).into_response()
+}
+
+/// POST /api/admin/accounts/batch-delete
+pub async fn batch_delete_accounts(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<BatchDeleteRequest>,
+) -> impl IntoResponse {
+    if let Err(code) = verify_admin(&state, &headers) {
+        return (code, Json(json!({"error": "unauthorized"}))).into_response();
+    }
+
+    let mut deleted = 0i64;
+    if !req.ids.is_empty() {
+        if let Ok(n) = queries::batch_delete_accounts(&state.db, &req.ids).await {
+            deleted = n;
+        }
+        for id in &req.ids {
+            state.scheduler.remove_account(*id);
+        }
+    }
+
+    Json(json!({"message": "ok", "deleted": deleted})).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct BatchDeleteRequest {
+    pub ids: Vec<i64>,
 }
 
 /// POST /api/admin/accounts/{id}/refresh
@@ -1127,4 +1172,421 @@ pub async fn clean_error(
         }
     }
     Json(json!({"message": "ok", "cleaned": cleaned})).into_response()
+}
+
+// ─── 文件导入 ───
+
+/// POST /api/admin/accounts/import
+/// 支持 format: txt (默认, RT), json, at_txt
+pub async fn import_accounts(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    mut multipart: axum::extract::Multipart,
+) -> impl IntoResponse {
+    if let Err(code) = verify_admin(&state, &headers) {
+        return (code, "unauthorized".to_string()).into_response();
+    }
+
+    let mut format = "txt".to_string();
+    let mut proxy_url = String::new();
+    let mut file_data: Vec<u8> = Vec::new();
+
+    // 解析 multipart 字段
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = field.name().unwrap_or("").to_string();
+        match name.as_str() {
+            "format" => {
+                format = field.text().await.unwrap_or_else(|_| "txt".to_string());
+            }
+            "proxy_url" => {
+                proxy_url = field.text().await.unwrap_or_default();
+            }
+            "file" => {
+                file_data = field.bytes().await.unwrap_or_default().to_vec();
+            }
+            _ => {}
+        }
+    }
+
+    if file_data.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "请上传文件（字段名: file）"})).to_string(),
+        )
+            .into_response();
+    }
+
+    if file_data.len() > 2 * 1024 * 1024 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "文件大小不能超过 2MB"})).to_string(),
+        )
+            .into_response();
+    }
+
+    match format.as_str() {
+        "at_txt" => import_at_txt(state, file_data, proxy_url).await,
+        "json" => import_json(state, file_data, proxy_url).await,
+        _ => import_rt_txt(state, file_data, proxy_url).await,
+    }
+}
+
+/// SSE 进度事件
+fn sse_event(
+    event_type: &str,
+    current: usize,
+    total: usize,
+    success: usize,
+    duplicate: usize,
+    failed: usize,
+) -> String {
+    format!(
+        "data: {}\n\n",
+        json!({
+            "type": event_type,
+            "current": current,
+            "total": total,
+            "success": success,
+            "duplicate": duplicate,
+            "failed": failed,
+        })
+    )
+}
+
+/// AT TXT 文件导入 — 不走刷新路径
+async fn import_at_txt(
+    state: Arc<AppState>,
+    file_data: Vec<u8>,
+    proxy_url: String,
+) -> axum::response::Response {
+    let content = String::from_utf8_lossy(&file_data);
+
+    // 按行分割，去 BOM，文件内去重
+    let mut seen = std::collections::HashSet::new();
+    let mut tokens: Vec<String> = Vec::new();
+    for line in content.lines() {
+        let t = line.trim().trim_start_matches('\u{feff}');
+        if !t.is_empty() && seen.insert(t.to_string()) {
+            tokens.push(t.to_string());
+        }
+    }
+
+    if tokens.is_empty() {
+        return Json(json!({"error": "文件中未找到有效的 Access Token"})).into_response();
+    }
+
+    // 数据库去重
+    let existing = queries::get_all_access_tokens(&state.db).await.unwrap_or_default();
+    let mut new_tokens: Vec<String> = Vec::new();
+    let mut duplicate_count = 0usize;
+    for at in &tokens {
+        if existing.contains(at) {
+            duplicate_count += 1;
+        } else {
+            new_tokens.push(at.clone());
+        }
+    }
+    let total = tokens.len();
+
+    if new_tokens.is_empty() {
+        return Json(json!({
+            "message": format!("所有 {} 个 AT 已存在，无需导入", total),
+            "success": 0, "duplicate": duplicate_count, "failed": 0, "total": total,
+        }))
+        .into_response();
+    }
+
+    // SSE 流式响应
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+
+    tokio::spawn(async move {
+        let sem = Arc::new(tokio::sync::Semaphore::new(20));
+        let success = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let current = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::new();
+
+        for (idx, at) in new_tokens.into_iter().enumerate() {
+            let sem = sem.clone();
+            let state = state.clone();
+            let proxy_url = proxy_url.clone();
+            let success = success.clone();
+            let failed = failed.clone();
+            let current = current.clone();
+
+            handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+
+                let info = token::parse_id_token(&at).unwrap_or_default();
+                let expires_at = if info.expires_at > 0 {
+                    chrono::DateTime::from_timestamp(info.expires_at, 0)
+                        .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::hours(1))
+                } else {
+                    chrono::Utc::now() + chrono::Duration::hours(1)
+                };
+
+                let creds = Credentials {
+                    access_token: at.clone(),
+                    email: info.email.clone(),
+                    account_id: info.chatgpt_account_id.clone(),
+                    plan_type: info.chatgpt_plan_type.clone(),
+                    expires_at: expires_at.to_rfc3339(),
+                    ..Default::default()
+                };
+
+                let name = if info.email.is_empty() {
+                    format!("at-import-{}", idx + 1)
+                } else {
+                    info.email.clone()
+                };
+
+                match queries::insert_at_account(&state.db, &name, &creds, &proxy_url).await {
+                    Ok(id) => {
+                        let account = Arc::new(Account::new(id));
+                        *account.email.write() = info.email;
+                        *account.plan_type.write() = info.chatgpt_plan_type;
+                        *account.proxy_url.write() = proxy_url;
+                        *account.access_token.write() = at;
+                        *account.codex_account_id.write() = info.chatgpt_account_id;
+                        *account.expires_at.write() = expires_at;
+                        state.scheduler.add_account(account);
+                        success.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                current.fetch_add(1, Ordering::Relaxed);
+            }));
+        }
+
+        // 进度推送
+        let tx2 = tx.clone();
+        let success2 = success.clone();
+        let failed2 = failed.clone();
+        let current2 = current.clone();
+        let progress_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
+            loop {
+                interval.tick().await;
+                let cur = current2.load(Ordering::Relaxed) + duplicate_count;
+                let suc = success2.load(Ordering::Relaxed);
+                let fai = failed2.load(Ordering::Relaxed);
+                let _ = tx2
+                    .send(sse_event("progress", cur, total, suc, duplicate_count, fai))
+                    .await;
+                if cur >= total {
+                    break;
+                }
+            }
+        });
+
+        for h in handles {
+            let _ = h.await;
+        }
+        progress_handle.abort();
+
+        let suc = success.load(Ordering::Relaxed);
+        let fai = failed.load(Ordering::Relaxed);
+        let _ = tx
+            .send(sse_event("complete", total, total, suc, duplicate_count, fai))
+            .await;
+    });
+
+    axum::response::Response::builder()
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "keep-alive")
+        .header("X-Accel-Buffering", "no")
+        .body(axum::body::Body::from_stream(stream.map(Ok::<_, std::convert::Infallible>)))
+        .unwrap()
+}
+
+/// RT TXT 文件导入
+async fn import_rt_txt(
+    state: Arc<AppState>,
+    file_data: Vec<u8>,
+    proxy_url: String,
+) -> axum::response::Response {
+    let content = String::from_utf8_lossy(&file_data);
+
+    let mut seen = std::collections::HashSet::new();
+    let mut tokens: Vec<String> = Vec::new();
+    for line in content.lines() {
+        let t = line.trim().trim_start_matches('\u{feff}');
+        if !t.is_empty() && seen.insert(t.to_string()) {
+            tokens.push(t.to_string());
+        }
+    }
+
+    if tokens.is_empty() {
+        return Json(json!({"error": "文件中未找到有效的 Refresh Token"})).into_response();
+    }
+
+    // 数据库去重
+    let existing = queries::get_all_refresh_tokens(&state.db).await.unwrap_or_default();
+    let mut new_tokens: Vec<String> = Vec::new();
+    let mut duplicate_count = 0usize;
+    for rt in &tokens {
+        if existing.contains(rt) {
+            duplicate_count += 1;
+        } else {
+            new_tokens.push(rt.clone());
+        }
+    }
+    let total = tokens.len();
+
+    if new_tokens.is_empty() {
+        return Json(json!({
+            "message": format!("所有 {} 个 RT 已存在，无需导入", total),
+            "success": 0, "duplicate": duplicate_count, "failed": 0, "total": total,
+        }))
+        .into_response();
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+
+    tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        let sem = Arc::new(tokio::sync::Semaphore::new(10));
+        let success = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let current = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::new();
+
+        for rt in new_tokens {
+            let client = client.clone();
+            let sem = sem.clone();
+            let state = state.clone();
+            let proxy_url = proxy_url.clone();
+            let success = success.clone();
+            let failed = failed.clone();
+            let current = current.clone();
+
+            handles.push(tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+
+                match token::refresh::refresh_with_retry(&client, &rt).await {
+                    Ok(token_resp) => {
+                        let info = token::parse_id_token(&token_resp.id_token).unwrap_or_default();
+                        let expires_at = chrono::Utc::now()
+                            + chrono::Duration::seconds(token_resp.expires_in);
+
+                        let creds = Credentials {
+                            refresh_token: if token_resp.refresh_token.is_empty() {
+                                rt.clone()
+                            } else {
+                                token_resp.refresh_token
+                            },
+                            access_token: token_resp.access_token.clone(),
+                            id_token: token_resp.id_token,
+                            expires_at: expires_at.to_rfc3339(),
+                            email: info.email.clone(),
+                            account_id: info.chatgpt_account_id.clone(),
+                            plan_type: info.chatgpt_plan_type.clone(),
+                            ..Default::default()
+                        };
+
+                        let name = if info.email.is_empty() { rt[..8.min(rt.len())].to_string() } else { info.email.clone() };
+                        if let Ok(id) = queries::insert_account(&state.db, &name, &creds, &proxy_url).await {
+                            let account = Arc::new(Account::new(id));
+                            *account.email.write() = info.email;
+                            *account.plan_type.write() = info.chatgpt_plan_type;
+                            *account.proxy_url.write() = proxy_url;
+                            *account.access_token.write() = token_resp.access_token;
+                            *account.refresh_token.write() = creds.refresh_token;
+                            *account.expires_at.write() = expires_at;
+                            state.scheduler.add_account(account);
+                            success.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    Err(_) => {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                current.fetch_add(1, Ordering::Relaxed);
+            }));
+        }
+
+        // 进度推送
+        let tx2 = tx.clone();
+        let success2 = success.clone();
+        let failed2 = failed.clone();
+        let current2 = current.clone();
+        let progress_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(200));
+            loop {
+                interval.tick().await;
+                let cur = current2.load(Ordering::Relaxed) + duplicate_count;
+                let suc = success2.load(Ordering::Relaxed);
+                let fai = failed2.load(Ordering::Relaxed);
+                let _ = tx2
+                    .send(sse_event("progress", cur, total, suc, duplicate_count, fai))
+                    .await;
+                if cur >= total {
+                    break;
+                }
+            }
+        });
+
+        for h in handles {
+            let _ = h.await;
+        }
+        progress_handle.abort();
+
+        let suc = success.load(Ordering::Relaxed);
+        let fai = failed.load(Ordering::Relaxed);
+        let _ = tx
+            .send(sse_event("complete", total, total, suc, duplicate_count, fai))
+            .await;
+    });
+
+    axum::response::Response::builder()
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "keep-alive")
+        .header("X-Accel-Buffering", "no")
+        .body(axum::body::Body::from_stream(stream.map(Ok::<_, std::convert::Infallible>)))
+        .unwrap()
+}
+
+/// JSON 文件导入
+async fn import_json(
+    state: Arc<AppState>,
+    file_data: Vec<u8>,
+    proxy_url: String,
+) -> axum::response::Response {
+    let content = String::from_utf8_lossy(&file_data);
+    let content = content.trim_start_matches('\u{feff}');
+
+    #[derive(Deserialize)]
+    struct JsonEntry {
+        refresh_token: String,
+        #[serde(default)]
+        email: String,
+    }
+
+    let entries: Vec<JsonEntry> = if let Ok(arr) = serde_json::from_str::<Vec<JsonEntry>>(content) {
+        arr
+    } else if let Ok(single) = serde_json::from_str::<JsonEntry>(content) {
+        vec![single]
+    } else {
+        return Json(json!({"error": "不是有效的 JSON 格式"})).into_response();
+    };
+
+    let tokens: Vec<String> = entries
+        .into_iter()
+        .map(|e| e.refresh_token.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    if tokens.is_empty() {
+        return Json(json!({"error": "JSON 文件中未找到有效的 refresh_token"})).into_response();
+    }
+
+    import_rt_txt(state, tokens.join("\n").into_bytes(), proxy_url).await
 }

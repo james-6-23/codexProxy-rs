@@ -92,8 +92,6 @@ async fn proxy_request(
         return error_response(StatusCode::TOO_MANY_REQUESTS, "全局速率限制");
     }
 
-    info!(endpoint, model = %model, stream = is_stream, "收到请求");
-
     let mut exclude_set: HashSet<i64> = HashSet::new();
     let mut last_error = String::new();
 
@@ -118,6 +116,16 @@ async fn proxy_request(
         let proxy_url = account.proxy_url.read().clone();
         let codex_account_id = account.codex_account_id.read().clone();
         let account_id_str = account.db_id.to_string();
+
+        info!(
+            endpoint,
+            model = %model,
+            stream = is_stream,
+            account_id = account.db_id,
+            email = %account_email,
+            attempt = _attempt + 1,
+            "转发请求"
+        );
 
         // ── 构建上游请求体 ──
 

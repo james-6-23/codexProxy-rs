@@ -126,7 +126,7 @@ pub struct SystemSettings {
     pub pg_max_conns: i32,
 }
 
-fn default_pg_max_conns() -> i32 { 20 }
+fn default_pg_max_conns() -> i32 { 256 }
 
 // ─── 图表聚合数据 ───
 

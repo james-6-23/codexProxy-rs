@@ -85,7 +85,7 @@ async fn create_tables(pool: &PgPool) -> Result<()> {
             auto_clean_expired      BOOLEAN NOT NULL DEFAULT FALSE,
             fast_scheduler_enabled  BOOLEAN NOT NULL DEFAULT FALSE,
             max_retries             INT NOT NULL DEFAULT 2,
-            pg_max_conns            INT NOT NULL DEFAULT 20
+            pg_max_conns            INT NOT NULL DEFAULT 256
         )",
         // 兼容已有表：添加 pg_max_conns 列
         "DO $$ BEGIN

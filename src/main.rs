@@ -342,13 +342,33 @@ fn spawn_background_tasks(
         }
     });
 
-    // 6. 自动清理巡检（每 30 秒）
+    // 6. 自动清理巡检（每 30 秒 — 401/429/error）
     let state6 = state.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         loop {
             interval.tick().await;
             auto_cleanup_sweep(&state6).await;
+        }
+    });
+
+    // 7. 用量满账号清理（每 5 分钟）
+    let state7 = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(300));
+        loop {
+            interval.tick().await;
+            auto_cleanup_full_usage(&state7).await;
+        }
+    });
+
+    // 8. 过期账号清理（每 15 分钟）
+    let state8 = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(900));
+        loop {
+            interval.tick().await;
+            auto_cleanup_expired(&state8).await;
         }
     });
 }
@@ -462,52 +482,36 @@ async fn probe_recovery(state: &AppState, client: &reqwest::Client) {
     }
 }
 
-/// 自动清理巡检 — 根据 settings 开关清理对应状态的账号
+/// 自动清理巡检（30s）— 401 / 429 / error
 async fn auto_cleanup_sweep(state: &AppState) {
     let settings = state.db_settings_cache.read().unwrap().clone();
 
-    // 没有开启任何自动清理开关则直接返回
     if !settings.auto_clean_unauthorized
         && !settings.auto_clean_rate_limited
         && !settings.auto_clean_error
-        && !settings.auto_clean_expired
     {
         return;
     }
 
     let accounts = state.scheduler.all_accounts();
-    let now = chrono::Utc::now();
     let mut cleaned = 0u32;
 
     for acc in &accounts {
         let tier = acc.health_tier.load(std::sync::atomic::Ordering::Relaxed);
         let should_clean = match tier {
-            // BANNED（401）— 检查 auto_clean_unauthorized
+            // BANNED（401）
             scheduler::TIER_BANNED if settings.auto_clean_unauthorized => {
                 acc.last_unauthorized_at.load(std::sync::atomic::Ordering::Relaxed) > 0
             }
-            // 处于冷却期的 rate-limited — 检查 auto_clean_rate_limited
-            _ if settings.auto_clean_rate_limited && acc.is_in_cooldown() => {
-                let cooldown_until = acc.cooldown_until.load(std::sync::atomic::Ordering::Relaxed);
-                // 只清理冷却时间 > 1 小时的（避免误清短暂限流）
-                cooldown_until - now.timestamp() > 3600
-            }
-            // RISKY（多次失败）— 检查 auto_clean_error
+            // RISKY（多次失败 / error）
             scheduler::TIER_RISKY if settings.auto_clean_error => true,
             _ => false,
         };
 
-        // 过期 AT 账号清理
-        let expired_clean = if settings.auto_clean_expired {
-            let rt = acc.refresh_token.read().clone();
-            let expires = *acc.expires_at.read();
-            // AT-only 且已过期超过 10 分钟
-            rt.is_empty() && expires < now - chrono::Duration::minutes(10)
-        } else {
-            false
-        };
+        // 429 rate_limited — 处于冷却期的账号
+        let rate_limited_clean = settings.auto_clean_rate_limited && acc.is_in_cooldown();
 
-        if should_clean || expired_clean {
+        if should_clean || rate_limited_clean {
             let _ = db::queries::delete_account(&state.db, acc.db_id).await;
             state.scheduler.remove_account(acc.db_id);
             cleaned += 1;
@@ -516,5 +520,69 @@ async fn auto_cleanup_sweep(state: &AppState) {
 
     if cleaned > 0 {
         info!(cleaned, "自动清理完成");
+    }
+}
+
+/// 用量满账号清理（5 分钟）— usage ≥ 100%
+async fn auto_cleanup_full_usage(state: &AppState) {
+    let enabled = state.db_settings_cache.read()
+        .map(|s| s.auto_clean_full_usage)
+        .unwrap_or(false);
+    if !enabled {
+        return;
+    }
+
+    let accounts = state.scheduler.all_accounts();
+    let mut cleaned = 0u32;
+
+    for acc in &accounts {
+        // 跳过正在处理请求的账号
+        if acc.active_requests.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            continue;
+        }
+
+        // 7 天用量 ≥ 100%（存储为 pct * 100 的整数）
+        let usage_7d = acc.usage_7d_pct_100.load(std::sync::atomic::Ordering::Relaxed);
+        if usage_7d >= 10000 {
+            let _ = db::queries::delete_account(&state.db, acc.db_id).await;
+            state.scheduler.remove_account(acc.db_id);
+            cleaned += 1;
+            info!(account_id = acc.db_id, usage_pct = usage_7d as f64 / 100.0, "用量满，自动清理");
+        }
+    }
+
+    if cleaned > 0 {
+        info!(cleaned, "用量满清理完成");
+    }
+}
+
+/// 过期账号清理（15 分钟）— AT 过期超过 30 分钟
+async fn auto_cleanup_expired(state: &AppState) {
+    let enabled = state.db_settings_cache.read()
+        .map(|s| s.auto_clean_expired)
+        .unwrap_or(false);
+    if !enabled {
+        return;
+    }
+
+    let accounts = state.scheduler.all_accounts();
+    let now = chrono::Utc::now();
+    let threshold = now - chrono::Duration::minutes(30);
+    let mut cleaned = 0u32;
+
+    for acc in &accounts {
+        let rt = acc.refresh_token.read().clone();
+        let expires = *acc.expires_at.read();
+
+        // AT-only 账号（无 refresh_token）且已过期超过 30 分钟
+        if rt.is_empty() && expires < threshold {
+            let _ = db::queries::delete_account(&state.db, acc.db_id).await;
+            state.scheduler.remove_account(acc.db_id);
+            cleaned += 1;
+        }
+    }
+
+    if cleaned > 0 {
+        info!(cleaned, "过期账号清理完成");
     }
 }

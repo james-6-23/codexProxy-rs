@@ -23,15 +23,6 @@ jobs:
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             archive: tar.gz
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            archive: tar.gz
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            archive: tar.gz
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            archive: zip
 
     runs-on: ${{ matrix.os }}
 
@@ -73,8 +64,7 @@ jobs:
         shell: bash
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package (Unix)
-        if: matrix.archive == 'tar.gz'
+      - name: Package
         shell: bash
         run: |
           version="${VERSION#v}"
@@ -84,30 +74,11 @@ jobs:
           cp .env.example "dist/${name}/"
           tar -C dist -czf "dist/${name}.tar.gz" "${name}"
 
-      - name: Package (Windows)
-        if: matrix.archive == 'zip'
-        shell: bash
-        run: |
-          version="${VERSION#v}"
-          name="codex-proxy_${version}_${{ matrix.target }}"
-          mkdir -p "dist/${name}"
-          cp "target/${{ matrix.target }}/release/codex-proxy.exe" "dist/${name}/"
-          cp .env.example "dist/${name}/"
-          cd dist && 7z a "${name}.zip" "${name}"
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.target }}
           path: dist/*.tar.gz
-          if-no-files-found: ignore
-
-      - name: Upload artifact (zip)
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-${{ matrix.target }}-zip
-          path: dist/*.zip
-          if-no-files-found: ignore
 
   publish:
     needs: release
@@ -123,7 +94,7 @@ jobs:
 
       - name: Generate checksums
         working-directory: dist
-        run: sha256sum *.tar.gz *.zip 2>/dev/null > SHA256SUMS.txt || true
+        run: sha256sum *.tar.gz > SHA256SUMS.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -131,5 +102,4 @@ jobs:
           generate_release_notes: true
           files: |
             dist/*.tar.gz
-            dist/*.zip
             dist/SHA256SUMS.txt

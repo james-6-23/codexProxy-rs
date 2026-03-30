@@ -51,8 +51,8 @@ export default function Layout({ children }: PropsWithChildren) {
             <div className="pb-6 border-b border-border">
               <div className="flex items-center gap-3.5">
                 <img src={logoImg} alt="CodexProxy-rs" className="w-[52px] h-[52px] rounded-2xl object-cover shadow-[0_4px_16px_hsl(258_60%_63%/0.2)] shrink-0" />
-                <div className="flex flex-col gap-1">
-                  <h1 className="text-[26px] leading-tight font-bold bg-gradient-to-br from-[hsl(258,60%,63%)] to-[hsl(210,80%,60%)] bg-clip-text text-transparent">
+                <div className="flex flex-col gap-1 min-w-0">
+                  <h1 className="text-[22px] leading-tight font-bold text-foreground whitespace-nowrap">
                     CodexProxy-rs
                   </h1>
                   <span

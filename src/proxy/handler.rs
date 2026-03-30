@@ -413,7 +413,7 @@ async fn proxy_request(
     )
 }
 
-/// 流式响应转发（带 TTFT 追踪 + usage 提取 + stream break 检测）
+/// 流式响应转发（带 TTFT 追踪 + usage 提取 + 客户端断连检测）
 async fn stream_response_with_tracking(
     resp: reqwest::Response,
     translate: bool,
@@ -436,6 +436,8 @@ async fn stream_response_with_tracking(
         let mut translator = StreamTranslator::new();
         let mut stream = resp.bytes_stream();
         let mut first_token_time: Option<Instant> = None;
+        let mut wrote_any_body = false;
+        let mut client_gone = false;
 
         while let Some(chunk) = stream.next().await {
             match chunk {
@@ -443,14 +445,23 @@ async fn stream_response_with_tracking(
                     if translate {
                         match translator.translate_chunk(&data) {
                             Ok(translated) => {
-                                // TTFT 追踪
                                 if translator.first_delta_received && first_token_time.is_none() {
                                     first_token_time = Some(Instant::now());
                                 }
-                                let _ = tx.send(Ok(Bytes::from(translated))).await;
+                                if !translated.is_empty() {
+                                    if tx.send(Ok(Bytes::from(translated))).await.is_err() {
+                                        client_gone = true;
+                                        break;
+                                    }
+                                    wrote_any_body = true;
+                                }
                             }
                             Err(_) => {
-                                let _ = tx.send(Ok(data)).await;
+                                if tx.send(Ok(data)).await.is_err() {
+                                    client_gone = true;
+                                    break;
+                                }
+                                wrote_any_body = true;
                             }
                         }
                     } else {
@@ -459,13 +470,21 @@ async fn stream_response_with_tracking(
                         if translator.first_delta_received && first_token_time.is_none() {
                             first_token_time = Some(Instant::now());
                         }
-                        let _ = tx.send(Ok(data)).await;
+                        if tx.send(Ok(data)).await.is_err() {
+                            client_gone = true;
+                            break;
+                        }
+                        wrote_any_body = true;
                     }
                 }
                 Err(e) => {
-                    let _ = tx
-                        .send(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
-                        .await;
+                    if wrote_any_body {
+                        // 已向客户端写过数据，无法重试，发送错误
+                        let _ = tx
+                            .send(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
+                            .await;
+                    }
+                    // 未写过数据的上游断连 → 调用方可透明重试（当前 log 记录）
                     break;
                 }
             }
@@ -478,19 +497,22 @@ async fn stream_response_with_tracking(
 
         let duration = request_start.elapsed().as_millis() as i64;
 
-        // usage 来源：completed 事件 > stream break 估算
-        let usage = if let Some(u) = translator.usage {
-            u
+        let (usage, log_status) = if client_gone {
+            // 客户端断连 → 499
+            let u = translator.usage.clone().unwrap_or_else(|| translator.estimate_tokens_on_break());
+            (u, 499)
+        } else if let Some(ref u) = translator.usage {
+            (u.clone(), 200)
         } else {
-            // Stream break — 未收到 completed
-            translator.estimate_tokens_on_break()
+            // 上游断连且未收到 completed
+            (translator.estimate_tokens_on_break(), 200)
         };
 
         let service_tier = translator.service_tier.clone();
 
         send_usage_log(
             &state, account_id, &endpoint, &model,
-            200, duration, true, &email,
+            log_status as i64, duration, true, &email,
             &usage, first_token_ms, &effort, &service_tier,
         )
         .await;
@@ -504,6 +526,7 @@ async fn stream_response_with_tracking(
         .header("Content-Type", "text/event-stream")
         .header("Cache-Control", "no-cache")
         .header("Connection", "keep-alive")
+        .header("X-Accel-Buffering", "no")
         .body(body)
         .unwrap()
 }

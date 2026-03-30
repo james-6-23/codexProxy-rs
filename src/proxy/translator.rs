@@ -209,6 +209,7 @@ pub fn strip_unsupported_fields(body: &mut Value) {
 // ─── 响应翻译 ───
 
 /// 从 Codex 响应中提取 usage 详细信息
+#[derive(Clone)]
 pub struct UsageInfo {
     pub input_tokens: i64,
     pub output_tokens: i64,

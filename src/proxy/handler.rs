@@ -148,6 +148,17 @@ async fn proxy_request(
         // 清理 Codex 不支持的字段
         translator::strip_unsupported_fields(&mut upstream_body);
 
+        // 自动将字符串 input 包装为数组格式（Codex 要求 input 为 list）
+        if let Some(input) = upstream_body.get("input") {
+            if input.is_string() {
+                let text = input.as_str().unwrap_or("").to_string();
+                upstream_body["input"] = serde_json::json!([{
+                    "role": "user",
+                    "content": text,
+                }]);
+            }
+        }
+
         // Session / prompt cache
         let session_id = resolve_session_id(&body_json, &headers, &account_id_str);
         if !session_id.is_empty() && upstream_body.get("prompt_cache_key").is_none() {
@@ -202,7 +213,7 @@ async fn proxy_request(
                     state.scheduler.recompute_health(&account);
                     state.scheduler.notify_available();
 
-                    let msg = format!("{} \u{2190} 上游请求成功", colored_status(200));
+                    let msg = format!("{} ← 上游请求成功", status.as_u16());
                     info!(
                         endpoint,
                         model = %model,
@@ -274,17 +285,29 @@ async fn proxy_request(
                 let duration = request_start.elapsed().as_millis() as i64;
                 let status_u16 = status.as_u16();
 
-                // 输出上游错误日志
-                let msg = format!("{} \u{2190} 上游返回错误", colored_status(status_u16));
-                warn!(
-                    endpoint,
-                    model = %model,
-                    account_id = account.db_id,
-                    email = %account_email,
-                    attempt = _attempt + 1,
-                    body = %error_body.chars().take(200).collect::<String>(),
-                    "{msg}"
-                );
+                // 输出上游错误日志（401 → ERROR 红色，其余 → WARN 黄色）
+                let err_body_short: String = error_body.chars().take(200).collect();
+                if status_u16 == 401 {
+                    error!(
+                        endpoint,
+                        model = %model,
+                        account_id = account.db_id,
+                        email = %account_email,
+                        attempt = _attempt + 1,
+                        body = %err_body_short,
+                        "401 ← 上游返回错误"
+                    );
+                } else {
+                    warn!(
+                        endpoint,
+                        model = %model,
+                        account_id = account.db_id,
+                        email = %account_email,
+                        attempt = _attempt + 1,
+                        body = %err_body_short,
+                        "{status_u16} ← 上游返回错误"
+                    );
+                }
 
                 // 记录错误请求日志
                 {
@@ -646,16 +669,6 @@ fn resolve_session_id(body: &Value, downstream_headers: &HeaderMap, account_id: 
     // 3. 兜底：基于账号 ID 生成确定性 UUID
     let seed = format!("codex2api:prompt-cache:auth:{}", account_id);
     uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, seed.as_bytes()).to_string()
-}
-
-/// 状态码着色：200 绿色、401 红色、其余黄色
-fn colored_status(code: u16) -> String {
-    let (color_code, reset) = match code {
-        200..=299 => ("32", "\x1b[0m"),  // 绿
-        401 => ("31", "\x1b[0m"),         // 红
-        _ => ("33", "\x1b[0m"),           // 黄
-    };
-    format!("\x1b[{color_code}m{code}{reset}")
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response {

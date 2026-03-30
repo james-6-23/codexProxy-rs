@@ -10,7 +10,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use serde_json::Value;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::proxy::translator::{self, StreamTranslator, UsageInfo};
 use crate::scheduler::FailureType;
@@ -91,6 +91,8 @@ async fn proxy_request(
     if !state.rate_limiter.allow() {
         return error_response(StatusCode::TOO_MANY_REQUESTS, "全局速率限制");
     }
+
+    info!(endpoint, model = %model, stream = is_stream, "收到请求");
 
     let mut exclude_set: HashSet<i64> = HashSet::new();
     let mut last_error = String::new();
@@ -193,6 +195,14 @@ async fn proxy_request(
                     state.scheduler.recompute_health(&account);
                     state.scheduler.notify_available();
 
+                    info!(
+                        endpoint,
+                        model = %model,
+                        account_id = account.db_id,
+                        latency_ms,
+                        "上游请求成功"
+                    );
+
                     if is_stream || translate {
                         // 流式转发 — 带 TTFT 追踪 + usage 提取 + stream break 检测
                         return stream_response_with_tracking(
@@ -254,6 +264,17 @@ async fn proxy_request(
                 let error_body = resp.text().await.unwrap_or_default();
                 let duration = request_start.elapsed().as_millis() as i64;
                 let status_u16 = status.as_u16();
+
+                // 输出上游错误日志（类似 codex2api 的 "上游返回错误"）
+                warn!(
+                    endpoint,
+                    model = %model,
+                    account_id = account.db_id,
+                    status = status_u16,
+                    attempt = _attempt + 1,
+                    body = %error_body.chars().take(200).collect::<String>(),
+                    "上游返回错误"
+                );
 
                 // 记录错误请求日志
                 {

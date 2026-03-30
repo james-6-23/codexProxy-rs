@@ -277,21 +277,48 @@ async fn proxy_request(
                 match status_u16 {
                     401 => {
                         account.report_failure(FailureType::Unauthorized);
-                        state.scheduler.mark_banned(&account);
+                        // 检查是否开启自动清理 401 账号
+                        let auto_clean = state.db_settings_cache.read()
+                            .map(|s| s.auto_clean_unauthorized)
+                            .unwrap_or(false);
+                        if auto_clean {
+                            warn!(account_id = account.db_id, "账号 401，自动清理");
+                            let db = state.db.clone();
+                            let aid = account.db_id;
+                            tokio::spawn(async move {
+                                let _ = crate::db::queries::delete_account(&db, aid).await;
+                            });
+                            state.scheduler.remove_account(account.db_id);
+                        } else {
+                            state.scheduler.mark_banned(&account);
+                            warn!(account_id = account.db_id, "账号 401 banned");
+                        }
                         exclude_set.insert(account.db_id);
                         last_error = format!("401: {}", error_body);
-                        warn!(account_id = account.db_id, "账号 401 banned");
                     }
                     429 => {
                         account.report_failure(FailureType::RateLimited);
-                        let cooldown =
-                            parse_rate_limit_cooldown(&resp_headers, &error_body, &account);
-                        state
-                            .scheduler
-                            .mark_cooldown(&account, "rate_limited", cooldown);
+                        let auto_clean = state.db_settings_cache.read()
+                            .map(|s| s.auto_clean_rate_limited)
+                            .unwrap_or(false);
+                        if auto_clean {
+                            warn!(account_id = account.db_id, "账号 429，自动清理");
+                            let db = state.db.clone();
+                            let aid = account.db_id;
+                            tokio::spawn(async move {
+                                let _ = crate::db::queries::delete_account(&db, aid).await;
+                            });
+                            state.scheduler.remove_account(account.db_id);
+                        } else {
+                            let cooldown =
+                                parse_rate_limit_cooldown(&resp_headers, &error_body, &account);
+                            state
+                                .scheduler
+                                .mark_cooldown(&account, "rate_limited", cooldown);
+                            warn!(account_id = account.db_id, cooldown, "账号 429");
+                        }
                         exclude_set.insert(account.db_id);
                         last_error = format!("429: {}", error_body);
-                        warn!(account_id = account.db_id, cooldown, "账号 429");
                     }
                     500..=599 => {
                         account.report_failure(FailureType::ServerError);

@@ -273,19 +273,22 @@ fn spawn_background_tasks(
     // 1. 使用日志批量写入
     let db = state.db.clone();
     tokio::spawn(async move {
-        let mut buffer: Vec<UsageLog> = Vec::with_capacity(256);
+        let mut buffer: Vec<UsageLog> = Vec::with_capacity(64);
+        // 使用 interval 而非 sleep — interval 不会因 recv 分支触发而重置
+        let mut flush_tick = tokio::time::interval(Duration::from_secs(2));
+        flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 Some(log) = log_rx.recv() => {
                     buffer.push(log);
-                    if buffer.len() >= 256 {
+                    if buffer.len() >= 64 {
                         if let Err(e) = db::queries::batch_insert_usage_logs(&db, &buffer).await {
                             error!("批量写入日志失败: {}", e);
                         }
                         buffer.clear();
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                _ = flush_tick.tick() => {
                     if !buffer.is_empty() {
                         if let Err(e) = db::queries::batch_insert_usage_logs(&db, &buffer).await {
                             error!("批量写入日志失败: {}", e);
@@ -336,6 +339,16 @@ fn spawn_background_tasks(
         loop {
             interval.tick().await;
             probe_recovery(&state5, &client).await;
+        }
+    });
+
+    // 6. 自动清理巡检（每 30 秒）
+    let state6 = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            auto_cleanup_sweep(&state6).await;
         }
     });
 }
@@ -446,5 +459,62 @@ async fn probe_recovery(state: &AppState, client: &reqwest::Client) {
             }
             Err(_) => {}
         }
+    }
+}
+
+/// 自动清理巡检 — 根据 settings 开关清理对应状态的账号
+async fn auto_cleanup_sweep(state: &AppState) {
+    let settings = state.db_settings_cache.read().unwrap().clone();
+
+    // 没有开启任何自动清理开关则直接返回
+    if !settings.auto_clean_unauthorized
+        && !settings.auto_clean_rate_limited
+        && !settings.auto_clean_error
+        && !settings.auto_clean_expired
+    {
+        return;
+    }
+
+    let accounts = state.scheduler.all_accounts();
+    let now = chrono::Utc::now();
+    let mut cleaned = 0u32;
+
+    for acc in &accounts {
+        let tier = acc.health_tier.load(std::sync::atomic::Ordering::Relaxed);
+        let should_clean = match tier {
+            // BANNED（401）— 检查 auto_clean_unauthorized
+            scheduler::TIER_BANNED if settings.auto_clean_unauthorized => {
+                acc.last_unauthorized_at.load(std::sync::atomic::Ordering::Relaxed) > 0
+            }
+            // 处于冷却期的 rate-limited — 检查 auto_clean_rate_limited
+            _ if settings.auto_clean_rate_limited && acc.is_in_cooldown() => {
+                let cooldown_until = acc.cooldown_until.load(std::sync::atomic::Ordering::Relaxed);
+                // 只清理冷却时间 > 1 小时的（避免误清短暂限流）
+                cooldown_until - now.timestamp() > 3600
+            }
+            // RISKY（多次失败）— 检查 auto_clean_error
+            scheduler::TIER_RISKY if settings.auto_clean_error => true,
+            _ => false,
+        };
+
+        // 过期 AT 账号清理
+        let expired_clean = if settings.auto_clean_expired {
+            let rt = acc.refresh_token.read().clone();
+            let expires = *acc.expires_at.read();
+            // AT-only 且已过期超过 10 分钟
+            rt.is_empty() && expires < now - chrono::Duration::minutes(10)
+        } else {
+            false
+        };
+
+        if should_clean || expired_clean {
+            let _ = db::queries::delete_account(&state.db, acc.db_id).await;
+            state.scheduler.remove_account(acc.db_id);
+            cleaned += 1;
+        }
+    }
+
+    if cleaned > 0 {
+        info!(cleaned, "自动清理完成");
     }
 }

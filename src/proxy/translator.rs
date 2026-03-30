@@ -336,6 +336,8 @@ pub struct StreamTranslator {
     pub usage: Option<UsageInfo>,
     /// service_tier
     pub service_tier: String,
+    /// 跨 TCP chunk 的行缓冲（SSE 事件可能跨 chunk 拆分）
+    pending: String,
 }
 
 impl StreamTranslator {
@@ -348,15 +350,35 @@ impl StreamTranslator {
             delta_chars: 0,
             usage: None,
             service_tier: String::new(),
+            pending: String::new(),
         }
+    }
+
+    /// 从 pending 缓冲中提取完整的行，返回完整行列表
+    /// 不完整的尾部数据保留在 pending 中
+    fn drain_lines(&mut self, new_data: &str) -> Vec<String> {
+        self.pending.push_str(new_data);
+        let mut lines = Vec::new();
+
+        loop {
+            let Some(pos) = self.pending.find('\n') else {
+                break;
+            };
+            let line = self.pending[..pos].trim_end_matches('\r').to_string();
+            self.pending = self.pending[pos + 1..].to_string();
+            lines.push(line);
+        }
+
+        lines
     }
 
     /// 翻译一个 SSE chunk，返回翻译后的 bytes
     pub fn translate_chunk(&mut self, data: &[u8]) -> Result<Vec<u8>, anyhow::Error> {
         let text = std::str::from_utf8(data)?;
+        let lines = self.drain_lines(text);
         let mut output = Vec::new();
 
-        for line in text.lines() {
+        for line in &lines {
             if let Some(json_str) = line.strip_prefix("data: ") {
                 if json_str == "[DONE]" {
                     output.extend_from_slice(b"data: [DONE]\n\n");
@@ -531,7 +553,9 @@ impl StreamTranslator {
             Err(_) => return,
         };
 
-        for line in text.lines() {
+        let lines = self.drain_lines(text);
+
+        for line in &lines {
             let json_str = match line.strip_prefix("data: ") {
                 Some(s) if s != "[DONE]" => s,
                 _ => continue,

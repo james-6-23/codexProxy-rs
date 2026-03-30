@@ -81,9 +81,12 @@ async fn proxy_request(
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    // 提取 reasoning_effort（兼容 Responses API 的 reasoning.effort 和 Chat API 的 reasoning_effort）
     let reasoning_effort = body_json
-        .get("reasoning_effort")
+        .get("reasoning")
+        .and_then(|r| r.get("effort"))
         .and_then(|v| v.as_str())
+        .or_else(|| body_json.get("reasoning_effort").and_then(|v| v.as_str()))
         .unwrap_or("")
         .to_string();
 

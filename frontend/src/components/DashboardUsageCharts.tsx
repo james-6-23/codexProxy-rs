@@ -106,7 +106,9 @@ export default function DashboardUsageCharts({
     const totalRequests = serverData.timeline.reduce((sum, p) => sum + p.requests, 0)
 
     const timelineData: TimelinePoint[] = serverData.timeline.map((point) => {
-      const d = new Date(point.bucket)
+      // 后端 bucket 不带时区后缀，追加 Z 确保按 UTC 解析，再转北京时间显示
+      const raw = point.bucket.includes('Z') || point.bucket.includes('+') ? point.bucket : point.bucket + 'Z'
+      const d = new Date(raw)
       return {
         label: useFullDate ? formatDateLabel(d, bucketMinutes) : formatMinuteLabel(d),
         fullLabel: formatFullLabel(d, bucketMinutes),

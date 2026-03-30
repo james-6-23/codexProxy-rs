@@ -7,6 +7,7 @@ const UNSUPPORTED_FIELDS: &[&str] = &[
     "logprobs", "top_logprobs", "n", "seed", "stop", "user",
     "logit_bias", "response_format", "stream_options",
     "truncation", "context_management",
+    "max_output_tokens", "max_tokens", "max_completion_tokens",
 ];
 
 // ─── Tool schema 中需要移除的 JSON Schema 关键字 ───
@@ -55,11 +56,6 @@ pub fn translate_chat_to_responses(chat_body: &Value) -> Value {
     if let Some(effort) = chat_body.get("reasoning_effort").and_then(|v| v.as_str()) {
         let clamped = clamp_reasoning_effort(effort);
         body["reasoning"] = json!({ "effort": clamped });
-    }
-
-    // max_tokens / max_completion_tokens → max_output_tokens
-    if let Some(max) = chat_body.get("max_completion_tokens").or_else(|| chat_body.get("max_tokens")) {
-        body["max_output_tokens"] = max.clone();
     }
 
     // tools（需要净化 schema）

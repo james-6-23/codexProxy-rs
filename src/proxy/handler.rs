@@ -120,11 +120,10 @@ async fn proxy_request(
         info!(
             endpoint,
             model = %model,
-            stream = is_stream,
             account_id = account.db_id,
             email = %account_email,
             attempt = _attempt + 1,
-            "转发请求"
+            "→ 转发请求"
         );
 
         // ── 构建上游请求体 ──
@@ -207,8 +206,9 @@ async fn proxy_request(
                         endpoint,
                         model = %model,
                         account_id = account.db_id,
+                        email = %account_email,
                         latency_ms,
-                        "上游请求成功"
+                        "\x1b[32m200\x1b[0m ← 上游请求成功"
                     );
 
                     if is_stream || translate {
@@ -273,15 +273,16 @@ async fn proxy_request(
                 let duration = request_start.elapsed().as_millis() as i64;
                 let status_u16 = status.as_u16();
 
-                // 输出上游错误日志（类似 codex2api 的 "上游返回错误"）
+                // 输出上游错误日志 — 状态码着色：401 红色，其余黄色
+                let color = if status_u16 == 401 { "\x1b[31m" } else { "\x1b[33m" };
                 warn!(
                     endpoint,
                     model = %model,
                     account_id = account.db_id,
-                    status = status_u16,
+                    email = %account_email,
                     attempt = _attempt + 1,
                     body = %error_body.chars().take(200).collect::<String>(),
-                    "上游返回错误"
+                    "{color}{status_u16}\x1b[0m ← 上游返回错误"
                 );
 
                 // 记录错误请求日志

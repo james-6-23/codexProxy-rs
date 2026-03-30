@@ -1,0 +1,48 @@
+# 本地构建部署
+name: codex-proxy-local
+
+services:
+  codex-proxy:
+    build: .
+    container_name: codex-proxy
+    ports:
+      - "${CODEX_PORT:-8080}:8080"
+    environment:
+      - CODEX_PORT=8080
+      - DATABASE_URL=postgres://codex:codex@postgres:5432/codex2api
+      - ADMIN_SECRET=${ADMIN_SECRET:-}
+      - PROXY_URL=${PROXY_URL:-}
+      - TZ=${TZ:-Asia/Shanghai}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - codex-net
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: codex-proxy-pg
+    environment:
+      - POSTGRES_USER=codex
+      - POSTGRES_PASSWORD=codex
+      - POSTGRES_DB=codex2api
+      - TZ=${TZ:-Asia/Shanghai}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U codex -d codex2api"]
+      interval: 3s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - codex-net
+
+networks:
+  codex-net:
+    driver: bridge
+
+volumes:
+  pgdata:
+    name: codex-proxy-local_pgdata

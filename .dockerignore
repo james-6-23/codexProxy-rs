@@ -1,0 +1,35 @@
+# Git
+.git/
+.gitignore
+
+# Go 原版
+codex2api/
+
+# Rust 构建产物
+target/
+
+# 前端依赖（Docker 内重新安装）
+codex2api/frontend/node_modules/
+codex2api/frontend/dist/
+frontend/dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 环境
+.env
+.env.local
+
+# Docker
+docker-compose*.yml
+.dockerignore
+
+# 数据
+data/
+*.db

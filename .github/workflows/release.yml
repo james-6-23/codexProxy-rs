@@ -1,0 +1,141 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: tar.gz
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            archive: tar.gz
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+
+    runs-on: ${{ matrix.os }}
+
+    env:
+      VERSION: ${{ github.ref_name }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build frontend
+        working-directory: codex2api/frontend
+        run: |
+          npm ci --no-audit --no-fund
+          npm run build
+
+      - name: Copy frontend dist
+        shell: bash
+        run: |
+          mkdir -p frontend/dist
+          cp -r codex2api/frontend/dist/* frontend/dist/
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools (Linux ARM64)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu musl-tools
+          rustup target add aarch64-unknown-linux-musl
+
+      - name: Install musl tools (Linux x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package (Unix)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          version="${VERSION#v}"
+          name="codex-proxy_${version}_${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          cp "target/${{ matrix.target }}/release/codex-proxy" "dist/${name}/"
+          cp .env.example "dist/${name}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+
+      - name: Package (Windows)
+        if: matrix.archive == 'zip'
+        shell: bash
+        run: |
+          version="${VERSION#v}"
+          name="codex-proxy_${version}_${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          cp "target/${{ matrix.target }}/release/codex-proxy.exe" "dist/${name}/"
+          cp .env.example "dist/${name}/"
+          cd dist && 7z a "${name}.zip" "${name}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: ignore
+
+      - name: Upload artifact (zip)
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}-zip
+          path: dist/*.zip
+          if-no-files-found: ignore
+
+  publish:
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum *.tar.gz *.zip 2>/dev/null > SHA256SUMS.txt || true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS.txt

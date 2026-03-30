@@ -104,6 +104,7 @@ async fn main() {
         settings: tokio::sync::RwLock::new(settings.clone()),
         db_settings_cache: std::sync::RwLock::new(settings.clone()),
         start_time: std::time::Instant::now(),
+        http_clients: dashmap::DashMap::new(),
     });
 
     // 启动后台任务
@@ -149,6 +150,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/admin/accounts/{id}", delete(admin::handler::delete_account))
         .route("/api/admin/accounts/batch-delete", post(admin::handler::batch_delete_accounts))
         .route("/api/admin/accounts/{id}/refresh", post(admin::handler::refresh_account))
+        .route("/api/admin/accounts/{id}/test", get(admin::handler::test_connection))
         .route("/api/admin/accounts/{id}/usage", get(admin::handler::account_usage))
         .route("/api/admin/accounts/batch-test", post(admin::handler::batch_test))
         .route("/api/admin/accounts/clean-banned", post(admin::handler::clean_banned))

@@ -679,6 +679,188 @@ pub async fn account_usage(
     }
 }
 
+/// GET /api/admin/accounts/{id}/test — 单账号测试连接（SSE 流式）
+pub async fn test_connection(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> axum::response::Response {
+    if let Err(code) = verify_admin(&state, &headers) {
+        return (code, Json(json!({"error": "unauthorized"}))).into_response();
+    }
+
+    let account = match state.scheduler.get_account(id) {
+        Some(a) => a,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "账号不在运行时池中"})),
+            )
+                .into_response();
+        }
+    };
+
+    let access_token = account.access_token.read().clone();
+    if access_token.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "账号没有可用的 Access Token，请先刷新"})),
+        )
+            .into_response();
+    }
+
+    let proxy_url = account.proxy_url.read().clone();
+    let codex_account_id = account.codex_account_id.read().clone();
+    let account_id_str = id.to_string();
+    let global_proxy = state.config.proxy_url.clone();
+    let test_model = {
+        let settings = state.db_settings_cache.read().unwrap();
+        settings.test_model.clone()
+    };
+
+    // SSE 流
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(32);
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+
+    tokio::spawn(async move {
+        let send_event = |tx: &tokio::sync::mpsc::Sender<String>, event: serde_json::Value| {
+            let msg = format!("data: {}\n\n", event);
+            let _ = tx.try_send(msg);
+        };
+
+        // test_start
+        send_event(&tx, json!({"type": "test_start", "model": &test_model}));
+
+        // 构建最小测试请求
+        let payload = json!({
+            "model": test_model,
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "Say hello in one sentence."}]}],
+            "stream": true,
+            "store": false,
+            "instructions": "You are a helpful assistant. Reply briefly.",
+        });
+
+        let upstream_url = format!("{}/responses", crate::proxy::UPSTREAM_BASE);
+        let ua = crate::proxy::useragent::ua_for_account(&account_id_str);
+        let version = crate::proxy::useragent::version_from_ua(ua);
+
+        // 构建 client（带代理）
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10));
+        let proxy_str = if !proxy_url.is_empty() {
+            Some(proxy_url.as_str())
+        } else {
+            global_proxy.as_deref()
+        };
+        if let Some(url) = proxy_str {
+            if let Ok(proxy) = reqwest::Proxy::all(url) {
+                builder = builder.proxy(proxy);
+            }
+        }
+        let client = builder.build().unwrap_or_else(|_| reqwest::Client::new());
+
+        let mut req = client
+            .post(&upstream_url)
+            .header("Authorization", format!("Bearer {}", access_token))
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream")
+            .header("User-Agent", ua)
+            .header("Version", version)
+            .header("Originator", crate::proxy::ORIGINATOR)
+            .json(&payload)
+            .timeout(std::time::Duration::from_secs(60));
+
+        if !codex_account_id.is_empty() {
+            req = req.header("Chatgpt-Account-Id", &codex_account_id);
+        }
+
+        let start = std::time::Instant::now();
+
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                send_event(&tx, json!({"type": "error", "error": format!("请求失败: {}", e)}));
+                return;
+            }
+        };
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            let truncated = if body.len() > 500 { &body[..500] } else { &body };
+            send_event(&tx, json!({"type": "error", "error": format!("上游返回 {}: {}", status, truncated)}));
+            return;
+        }
+
+        // 读取 SSE 流
+        use futures::StreamExt;
+        let mut stream = resp.bytes_stream();
+        let mut buffer = String::new();
+        let mut has_content = false;
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(_) => break,
+            };
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+            while let Some(pos) = buffer.find("\n\n") {
+                let line = buffer[..pos].to_string();
+                buffer = buffer[pos + 2..].to_string();
+
+                let data = line.strip_prefix("data: ").unwrap_or(&line);
+                if data.is_empty() || data == "[DONE]" {
+                    continue;
+                }
+
+                if let Ok(event) = serde_json::from_str::<serde_json::Value>(data) {
+                    let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    match event_type {
+                        "response.output_text.delta" => {
+                            if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
+                                if !delta.is_empty() {
+                                    has_content = true;
+                                    send_event(&tx, json!({"type": "content", "text": delta}));
+                                }
+                            }
+                        }
+                        "response.completed" => {
+                            let duration = start.elapsed().as_millis();
+                            send_event(&tx, json!({"type": "content", "text": format!("\n\n--- 耗时 {}ms ---", duration)}));
+                            send_event(&tx, json!({"type": "test_complete", "success": true}));
+                            return;
+                        }
+                        "response.failed" => {
+                            let err_msg = event
+                                .pointer("/response/status_details/error/message")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("上游返回 response.failed");
+                            send_event(&tx, json!({"type": "error", "error": err_msg}));
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        if !has_content {
+            send_event(&tx, json!({"type": "error", "error": "未收到模型输出"}));
+        }
+    });
+
+    axum::response::Response::builder()
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache")
+        .header("Connection", "keep-alive")
+        .header("X-Accel-Buffering", "no")
+        .body(axum::body::Body::from_stream(
+            stream.map(Ok::<_, std::convert::Infallible>),
+        ))
+        .unwrap()
+}
+
 /// POST /api/admin/accounts/batch-test
 pub async fn batch_test(
     State(state): State<Arc<AppState>>,

@@ -523,6 +523,51 @@ impl StreamTranslator {
         Ok(output)
     }
 
+    /// 在 passthrough 模式下解析 SSE 事件，提取 usage / TTFT / delta 字符数
+    /// 不产生翻译输出，只更新内部状态
+    pub fn track_raw_chunk(&mut self, data: &[u8]) {
+        let text = match std::str::from_utf8(data) {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+
+        for line in text.lines() {
+            let json_str = match line.strip_prefix("data: ") {
+                Some(s) if s != "[DONE]" => s,
+                _ => continue,
+            };
+
+            if let Ok(event) = serde_json::from_str::<Value>(json_str) {
+                let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                match event_type {
+                    "response.output_text.delta" => {
+                        self.first_delta_received = true;
+                        self.delta_chars += event
+                            .get("delta")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.len())
+                            .unwrap_or(0);
+                    }
+                    "response.completed" => {
+                        self.completed = true;
+                        if let Some(resp) = event.get("response") {
+                            self.usage = Some(extract_usage(resp));
+                            self.service_tier = resp
+                                .get("service_tier")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                        }
+                    }
+                    "response.failed" => {
+                        self.completed = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     /// 如果流中断（未收到 completed），估算 token
     pub fn estimate_tokens_on_break(&self) -> UsageInfo {
         let estimated_output = (self.delta_chars / 3).max(1) as i64;

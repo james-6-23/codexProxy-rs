@@ -56,7 +56,7 @@ pub async fn list_models() -> impl IntoResponse {
 /// 核心代理逻辑
 async fn proxy_request(
     state: Arc<AppState>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     body: Bytes,
     endpoint: &str,
     translate: bool,
@@ -140,7 +140,7 @@ async fn proxy_request(
         translator::strip_unsupported_fields(&mut upstream_body);
 
         // Session / prompt cache
-        let session_id = resolve_session_id(&body_json, &account_id_str);
+        let session_id = resolve_session_id(&body_json, &headers, &account_id_str);
         if !session_id.is_empty() && upstream_body.get("prompt_cache_key").is_none() {
             upstream_body["prompt_cache_key"] = Value::String(session_id.clone());
         }
@@ -150,7 +150,7 @@ async fn proxy_request(
         let upstream_url = format!("{}/responses", super::UPSTREAM_BASE);
         let ua = crate::proxy::useragent::ua_for_account(&account_id_str);
         let version = crate::proxy::useragent::version_from_ua(ua);
-        let client = build_client(&proxy_url, &state.config.proxy_url);
+        let client = get_or_create_client(&state, &proxy_url);
 
         let mut req = client
             .post(&upstream_url)
@@ -252,8 +252,29 @@ async fn proxy_request(
                 // ── 错误状态码 ──
                 account.release();
                 let error_body = resp.text().await.unwrap_or_default();
+                let duration = request_start.elapsed().as_millis() as i64;
+                let status_u16 = status.as_u16();
 
-                match status.as_u16() {
+                // 记录错误请求日志
+                {
+                    let s = state.clone();
+                    let ep = endpoint.to_string();
+                    let m = model.clone();
+                    let em = account_email.clone();
+                    let ef = reasoning_effort.clone();
+                    let aid = account.db_id;
+                    let sc = status_u16 as i64;
+                    tokio::spawn(async move {
+                        send_usage_log(
+                            &s, aid, &ep, &m,
+                            sc, duration, is_stream, &em,
+                            &UsageInfo { input_tokens: 0, output_tokens: 0, reasoning_tokens: 0, cached_tokens: 0, total_tokens: 0 },
+                            0, &ef, "",
+                        ).await;
+                    });
+                }
+
+                match status_u16 {
                     401 => {
                         account.report_failure(FailureType::Unauthorized);
                         state.scheduler.mark_banned(&account);
@@ -299,6 +320,26 @@ async fn proxy_request(
                 state.scheduler.recompute_health(&account);
                 exclude_set.insert(account.db_id);
                 last_error = format!("{}", e);
+
+                // 记录网络/超时错误日志（status_code=499 表示客户端连接错误）
+                let duration = request_start.elapsed().as_millis() as i64;
+                {
+                    let s = state.clone();
+                    let ep = endpoint.to_string();
+                    let m = model.clone();
+                    let em = account_email.clone();
+                    let ef = reasoning_effort.clone();
+                    let aid = account.db_id;
+                    tokio::spawn(async move {
+                        send_usage_log(
+                            &s, aid, &ep, &m,
+                            499, duration, is_stream, &em,
+                            &UsageInfo { input_tokens: 0, output_tokens: 0, reasoning_tokens: 0, cached_tokens: 0, total_tokens: 0 },
+                            0, &ef, "",
+                        ).await;
+                    });
+                }
+
                 if e.is_timeout() {
                     warn!(account_id = account.db_id, "超时");
                 } else {
@@ -356,12 +397,10 @@ async fn stream_response_with_tracking(
                             }
                         }
                     } else {
-                        // passthrough 模式也检测 delta 用于 TTFT
-                        if first_token_time.is_none() {
-                            let text = String::from_utf8_lossy(&data);
-                            if text.contains("\"delta\"") {
-                                first_token_time = Some(Instant::now());
-                            }
+                        // passthrough 模式 — 解析 SSE 事件提取 usage 和 TTFT
+                        translator.track_raw_chunk(&data);
+                        if translator.first_delta_received && first_token_time.is_none() {
+                            first_token_time = Some(Instant::now());
                         }
                         let _ = tx.send(Ok(data)).await;
                     }
@@ -414,25 +453,36 @@ async fn stream_response_with_tracking(
 
 // ─── 辅助函数 ───
 
-fn build_client(account_proxy: &str, global_proxy: &Option<String>) -> reqwest::Client {
-    let mut builder = reqwest::Client::builder()
-        .pool_max_idle_per_host(5)
-        .pool_idle_timeout(Duration::from_secs(60))
-        .connect_timeout(Duration::from_secs(10));
-
-    let proxy_url = if !account_proxy.is_empty() {
-        Some(account_proxy)
+/// 获取或创建 HTTP Client（按 proxy_url 池化复用，避免重复 TLS 握手）
+fn get_or_create_client(state: &AppState, account_proxy: &str) -> reqwest::Client {
+    let proxy_key = if !account_proxy.is_empty() {
+        account_proxy.to_string()
     } else {
-        global_proxy.as_deref()
+        state.config.proxy_url.clone().unwrap_or_default()
     };
 
-    if let Some(url) = proxy_url {
-        if let Ok(proxy) = reqwest::Proxy::all(url) {
+    // 命中缓存 → 直接复用（reqwest::Client 内部 Arc，clone 极轻量）
+    if let Some(client) = state.http_clients.get(&proxy_key) {
+        return client.clone();
+    }
+
+    // 创建新 Client，优化连接池参数
+    let mut builder = reqwest::Client::builder()
+        .pool_max_idle_per_host(20)
+        .pool_idle_timeout(Duration::from_secs(300))
+        .connect_timeout(Duration::from_secs(10))
+        .tcp_keepalive(Duration::from_secs(60))
+        .tcp_nodelay(true);
+
+    if !proxy_key.is_empty() {
+        if let Ok(proxy) = reqwest::Proxy::all(&proxy_key) {
             builder = builder.proxy(proxy);
         }
     }
 
-    builder.build().unwrap_or_else(|_| reqwest::Client::new())
+    let client = builder.build().unwrap_or_else(|_| reqwest::Client::new());
+    state.http_clients.insert(proxy_key, client.clone());
+    client
 }
 
 /// 解析 429 冷却时间 — 按 plan 和响应 header/body 智能判断
@@ -493,13 +543,27 @@ fn parse_rate_limit_cooldown(
     }
 }
 
-fn resolve_session_id(body: &Value, account_id: &str) -> String {
+/// 解析会话连续性 key（参考 codex2api ResolveContinuity）
+/// 优先级：prompt_cache_key > 下游 API Key > 账号 ID
+fn resolve_session_id(body: &Value, downstream_headers: &HeaderMap, account_id: &str) -> String {
+    // 1. 最高优先级：请求体中的 prompt_cache_key
     if let Some(key) = body.get("prompt_cache_key").and_then(|v| v.as_str()) {
         if !key.is_empty() {
             return key.to_string();
         }
     }
-    let seed = format!("codex2api:prompt-cache:{}", account_id);
+
+    // 2. 下游 Authorization header 中的 API Key（client_principal）
+    if let Some(auth) = downstream_headers.get("Authorization").and_then(|v| v.to_str().ok()) {
+        let api_key = auth.strip_prefix("Bearer ").unwrap_or(auth).trim();
+        if !api_key.is_empty() {
+            let seed = format!("codex2api:prompt-cache:{}", api_key);
+            return uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, seed.as_bytes()).to_string();
+        }
+    }
+
+    // 3. 兜底：基于账号 ID 生成确定性 UUID
+    let seed = format!("codex2api:prompt-cache:auth:{}", account_id);
     uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, seed.as_bytes()).to_string()
 }
 

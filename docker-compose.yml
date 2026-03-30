@@ -21,7 +21,7 @@ services:
       - codex-net
 
   postgres:
-    image: postgres:17-alpine
+    image: postgres:18-alpine
     container_name: codex-proxy-pg
     environment:
       - POSTGRES_USER=codex

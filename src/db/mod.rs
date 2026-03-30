@@ -22,10 +22,10 @@ pub async fn init(database_url: &str, pool_size: u32) -> Result<DbPool> {
 }
 
 /// 创建表结构（幂等）
+/// 注意：sqlx prepared statement 不支持多条 SQL，必须逐条执行
 async fn create_tables(pool: &PgPool) -> Result<()> {
-    sqlx::query(
-        "
-        CREATE TABLE IF NOT EXISTS accounts (
+    let statements = [
+        "CREATE TABLE IF NOT EXISTS accounts (
             id              BIGSERIAL PRIMARY KEY,
             name            TEXT NOT NULL DEFAULT '',
             platform        TEXT NOT NULL DEFAULT 'openai',
@@ -38,10 +38,9 @@ async fn create_tables(pool: &PgPool) -> Result<()> {
             cooldown_until  TIMESTAMPTZ,
             created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-        CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);
-
-        CREATE TABLE IF NOT EXISTS usage_logs (
+        )",
+        "CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status)",
+        "CREATE TABLE IF NOT EXISTS usage_logs (
             id                  BIGSERIAL PRIMARY KEY,
             account_id          BIGINT NOT NULL DEFAULT 0,
             endpoint            TEXT NOT NULL DEFAULT '',
@@ -61,18 +60,16 @@ async fn create_tables(pool: &PgPool) -> Result<()> {
             service_tier        TEXT NOT NULL DEFAULT '',
             account_email       TEXT NOT NULL DEFAULT '',
             created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-        CREATE INDEX IF NOT EXISTS idx_usage_logs_created ON usage_logs(created_at);
-        CREATE INDEX IF NOT EXISTS idx_usage_logs_status ON usage_logs(created_at, status_code);
-
-        CREATE TABLE IF NOT EXISTS api_keys (
+        )",
+        "CREATE INDEX IF NOT EXISTS idx_usage_logs_created ON usage_logs(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_usage_logs_status ON usage_logs(created_at, status_code)",
+        "CREATE TABLE IF NOT EXISTS api_keys (
             id          BIGSERIAL PRIMARY KEY,
             name        TEXT NOT NULL DEFAULT '',
             key         TEXT NOT NULL UNIQUE,
             created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-
-        CREATE TABLE IF NOT EXISTS system_settings (
+        )",
+        "CREATE TABLE IF NOT EXISTS system_settings (
             id                      INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
             max_concurrency         INT NOT NULL DEFAULT 2,
             global_rpm              INT NOT NULL DEFAULT 0,
@@ -87,31 +84,30 @@ async fn create_tables(pool: &PgPool) -> Result<()> {
             auto_clean_expired      BOOLEAN NOT NULL DEFAULT FALSE,
             fast_scheduler_enabled  BOOLEAN NOT NULL DEFAULT FALSE,
             max_retries             INT NOT NULL DEFAULT 2
-        );
-        INSERT INTO system_settings (id) VALUES (1) ON CONFLICT DO NOTHING;
-
-        CREATE TABLE IF NOT EXISTS usage_stats_baseline (
+        )",
+        "INSERT INTO system_settings (id) VALUES (1) ON CONFLICT DO NOTHING",
+        "CREATE TABLE IF NOT EXISTS usage_stats_baseline (
             id                  INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
             total_requests      BIGINT NOT NULL DEFAULT 0,
             total_tokens        BIGINT NOT NULL DEFAULT 0,
             prompt_tokens       BIGINT NOT NULL DEFAULT 0,
             completion_tokens   BIGINT NOT NULL DEFAULT 0,
             cached_tokens       BIGINT NOT NULL DEFAULT 0
-        );
-        INSERT INTO usage_stats_baseline (id) VALUES (1) ON CONFLICT DO NOTHING;
-
-        CREATE TABLE IF NOT EXISTS account_events (
+        )",
+        "INSERT INTO usage_stats_baseline (id) VALUES (1) ON CONFLICT DO NOTHING",
+        "CREATE TABLE IF NOT EXISTS account_events (
             id          BIGSERIAL PRIMARY KEY,
             account_id  BIGINT NOT NULL,
             event_type  TEXT NOT NULL DEFAULT '',
             source      TEXT NOT NULL DEFAULT '',
             created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-        CREATE INDEX IF NOT EXISTS idx_account_events_created ON account_events(created_at);
-        ",
-    )
-    .execute(pool)
-    .await?;
+        )",
+        "CREATE INDEX IF NOT EXISTS idx_account_events_created ON account_events(created_at)",
+    ];
+
+    for sql in statements {
+        sqlx::query(sql).execute(pool).await?;
+    }
 
     Ok(())
 }

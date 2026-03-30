@@ -89,8 +89,10 @@ async fn create_tables(pool: &PgPool) -> Result<()> {
         )",
         // 兼容已有表：添加 pg_max_conns 列
         "DO $$ BEGIN
-            ALTER TABLE system_settings ADD COLUMN pg_max_conns INT NOT NULL DEFAULT 20;
+            ALTER TABLE system_settings ADD COLUMN pg_max_conns INT NOT NULL DEFAULT 256;
         EXCEPTION WHEN duplicate_column THEN NULL; END $$",
+        // 将旧默认值 20 更新为 256
+        "UPDATE system_settings SET pg_max_conns = 256 WHERE id = 1 AND pg_max_conns = 20",
         "INSERT INTO system_settings (id) VALUES (1) ON CONFLICT DO NOTHING",
         "CREATE TABLE IF NOT EXISTS usage_stats_baseline (
             id                  INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),

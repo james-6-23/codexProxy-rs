@@ -104,14 +104,9 @@ pub async fn list_accounts(
         return (code, Json(json!({"error": "unauthorized"}))).into_response();
     }
 
-    // 从数据库读取真实的时间字段
-    let db_rows = queries::list_active_accounts(&state.db).await.unwrap_or_default();
-    let db_map: std::collections::HashMap<i64, &crate::db::models::AccountRow> =
-        db_rows.iter().map(|r| (r.id, r)).collect();
-
     let accounts = state.scheduler.all_accounts();
     let now = chrono::Utc::now().timestamp();
-    let mut result = Vec::new();
+    let mut result = Vec::with_capacity(accounts.len());
 
     for acc in &accounts {
         let email = acc.email.read().clone();
@@ -125,56 +120,11 @@ pub async fn list_accounts(
         let usage_7d = acc.usage_7d_pct_100.load(Ordering::Relaxed) as f64 / 100.0;
         let usage_5h = acc.usage_5h_pct_100.load(Ordering::Relaxed) as f64 / 100.0;
         let success_rate = acc.recent_results.read().success_rate();
-        let cooldown = acc.cooldown_until.load(Ordering::Relaxed);
         let rt_empty = acc.refresh_token.read().is_empty();
 
         let last_401 = acc.last_unauthorized_at.load(Ordering::Relaxed);
         let last_429 = acc.last_rate_limited_at.load(Ordering::Relaxed);
-        let last_timeout = acc.last_timeout_at.load(Ordering::Relaxed);
-        let last_5xx = acc.last_server_error_at.load(Ordering::Relaxed);
-        let fail_streak = acc.failure_streak.load(Ordering::Relaxed);
-        let success_streak = acc.success_streak.load(Ordering::Relaxed);
-
-        let unauthorized_penalty = if last_401 > 0 {
-            50.0 * (1.0 - (now - last_401) as f64 / 86400.0).max(0.0)
-        } else {
-            0.0
-        };
-        let rate_limit_penalty = if last_429 > 0 {
-            22.0 * (1.0 - (now - last_429) as f64 / 3600.0).max(0.0)
-        } else {
-            0.0
-        };
-        let timeout_penalty = if last_timeout > 0 {
-            18.0 * (1.0 - (now - last_timeout) as f64 / 900.0).max(0.0)
-        } else {
-            0.0
-        };
-        let server_penalty = if last_5xx > 0 {
-            12.0 * (1.0 - (now - last_5xx) as f64 / 900.0).max(0.0)
-        } else {
-            0.0
-        };
-        let failure_penalty = (fail_streak as f64 * 6.0).min(24.0);
-        let success_bonus = (success_streak as f64 * 2.0).min(12.0);
-
-        let usage_penalty_7d = if usage_7d >= 100.0 {
-            if plan == "free" { 40.0 } else { 20.0 }
-        } else if usage_7d >= 70.0 {
-            8.0
-        } else {
-            0.0
-        };
-
-        let latency_penalty = if latency >= 20000.0 {
-            15.0
-        } else if latency >= 10000.0 {
-            8.0
-        } else if latency >= 5000.0 {
-            4.0
-        } else {
-            0.0
-        };
+        let last_success = acc.last_success_at.load(Ordering::Relaxed);
 
         let status = if tier == scheduler::TIER_BANNED {
             "error"
@@ -187,13 +137,6 @@ pub async fn list_accounts(
         let success_requests = (total as f64 * success_rate) as u64;
         let error_requests = total - success_requests;
 
-        let last_success = acc.last_success_at.load(Ordering::Relaxed);
-
-        // 从数据库读取真实的创建/更新时间
-        let db_row = db_map.get(&acc.db_id);
-        let created_at = db_row.map(|r| &r.created_at);
-        let updated_at = db_row.map(|r| &r.updated_at);
-
         result.push(json!({
             "id": acc.db_id,
             "name": email,
@@ -204,30 +147,19 @@ pub async fn list_accounts(
             "health_tier": tier_name(tier),
             "scheduler_score": score,
             "dynamic_concurrency_limit": concurrency,
-            "scheduler_breakdown": {
-                "unauthorized_penalty": unauthorized_penalty,
-                "rate_limit_penalty": rate_limit_penalty,
-                "timeout_penalty": timeout_penalty,
-                "server_penalty": server_penalty,
-                "failure_penalty": failure_penalty,
-                "success_bonus": success_bonus,
-                "usage_penalty_7d": usage_penalty_7d,
-                "latency_penalty": latency_penalty,
-            },
             "active_requests": active,
             "total_requests": total,
             "success_requests": success_requests,
             "error_requests": error_requests,
             "usage_percent_7d": usage_7d,
             "usage_percent_5h": usage_5h,
+            "latency_ms": latency,
             "proxy_url": acc.proxy_url.read().clone(),
             "last_used_at": ts_to_rfc3339(last_success),
             "last_unauthorized_at": ts_to_rfc3339(last_401),
             "last_rate_limited_at": ts_to_rfc3339(last_429),
-            "last_timeout_at": ts_to_rfc3339(last_timeout),
-            "last_server_error_at": ts_to_rfc3339(last_5xx),
-            "created_at": created_at,
-            "updated_at": updated_at,
+            "created_at": acc.db_created_at.read().clone(),
+            "updated_at": acc.db_updated_at.read().clone(),
         }));
     }
 

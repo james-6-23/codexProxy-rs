@@ -74,6 +74,10 @@ pub struct Account {
     pub last_timeout_at: AtomicI64,
     pub last_server_error_at: AtomicI64,
 
+    // 数据库时间（RFC3339 字符串，list_accounts 用）
+    pub db_created_at: RwLock<String>,
+    pub db_updated_at: RwLock<String>,
+
     // 创建时间
     pub created_at: Instant,
 }
@@ -143,6 +147,8 @@ impl Account {
             last_rate_limited_at: AtomicI64::new(0),
             last_timeout_at: AtomicI64::new(0),
             last_server_error_at: AtomicI64::new(0),
+            db_created_at: RwLock::new(Utc::now().to_rfc3339()),
+            db_updated_at: RwLock::new(Utc::now().to_rfc3339()),
             created_at: Instant::now(),
         }
     }

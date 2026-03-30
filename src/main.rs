@@ -69,6 +69,10 @@ async fn main() {
         *account.access_token.write() = creds.access_token;
         *account.refresh_token.write() = creds.refresh_token;
 
+        // 缓存 DB 时间（list_accounts 直接从内存读取，不再每次查库）
+        *account.db_created_at.write() = row.created_at;
+        *account.db_updated_at.write() = row.updated_at;
+
         if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&creds.expires_at) {
             *account.expires_at.write() = dt.with_timezone(&chrono::Utc);
         }

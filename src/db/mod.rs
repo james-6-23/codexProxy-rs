@@ -40,6 +40,7 @@ async fn create_tables(pool: &PgPool) -> Result<()> {
             updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )",
         "CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status)",
+        "CREATE INDEX IF NOT EXISTS idx_accounts_status_id ON accounts(status, id)",
         "CREATE TABLE IF NOT EXISTS usage_logs (
             id                  BIGSERIAL PRIMARY KEY,
             account_id          BIGINT NOT NULL DEFAULT 0,

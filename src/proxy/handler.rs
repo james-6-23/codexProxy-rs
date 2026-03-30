@@ -227,7 +227,7 @@ async fn proxy_request(
                     );
 
                     if is_stream || translate {
-                        // 流式转发 — 带 TTFT 追踪 + usage 提取 + stream break 检测
+                        // 流式转发 — 带 TTFT 追踪 + usage 提取 + 客户端断连检测
                         return stream_response_with_tracking(
                             resp,
                             translate,
@@ -241,44 +241,18 @@ async fn proxy_request(
                         )
                         .await;
                     } else {
-                        // 非流式（Codex 始终返回 stream，这里是 passthrough 模式）
-                        let resp_body = resp.bytes().await.unwrap_or_default();
-                        let (final_body, usage) = if translate {
-                            match translator::translate_response_to_chat(&resp_body) {
-                                Ok((translated, u)) => (translated, Some(u)),
-                                Err(_) => (resp_body.to_vec(), None),
-                            }
-                        } else {
-                            let u = serde_json::from_slice::<Value>(&resp_body)
-                                .map(|v| translator::extract_usage(&v))
-                                .ok();
-                            (resp_body.to_vec(), u)
-                        };
-
-                        // 记录日志
-                        let u = usage.unwrap_or(UsageInfo {
-                            input_tokens: 0, output_tokens: 0,
-                            reasoning_tokens: 0, cached_tokens: 0, total_tokens: 0,
-                        });
-                        let duration = start.elapsed().as_millis() as i64;
-                        let log_state = state.clone();
-                        let log_model = model.clone();
-                        let log_endpoint = endpoint.to_string();
-                        let log_email = account_email.clone();
-                        let log_effort = reasoning_effort.clone();
-                        tokio::spawn(async move {
-                            send_usage_log(
-                                &log_state, account.db_id, &log_endpoint, &log_model,
-                                200, duration, false, &log_email,
-                                &u, 0, &log_effort, "",
-                            ).await;
-                        });
-
-                        return Response::builder()
-                            .status(StatusCode::OK)
-                            .header("Content-Type", "application/json")
-                            .body(Body::from(final_body))
-                            .unwrap();
+                        // sync 模式（Codex 仍返回 SSE，需读取流提取完整响应 + usage）
+                        return collect_sync_response(
+                            resp,
+                            state.clone(),
+                            account.db_id,
+                            endpoint,
+                            &model,
+                            &account_email,
+                            &reasoning_effort,
+                            start,
+                        )
+                        .await;
                     }
                 }
 
@@ -555,6 +529,100 @@ async fn stream_response_with_tracking(
         .header("Connection", "keep-alive")
         .header("X-Accel-Buffering", "no")
         .body(body)
+        .unwrap()
+}
+
+/// sync 模式 — 读取 SSE 流收集完整响应，一次性返回 JSON
+async fn collect_sync_response(
+    resp: reqwest::Response,
+    state: Arc<AppState>,
+    account_id: i64,
+    endpoint: &str,
+    model: &str,
+    email: &str,
+    reasoning_effort: &str,
+    request_start: Instant,
+) -> Response {
+    let mut translator = StreamTranslator::new();
+    let mut stream = resp.bytes_stream();
+    let mut first_token_time: Option<Instant> = None;
+    let mut last_completed_data: Option<Vec<u8>> = None;
+
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(data) => {
+                translator.track_raw_chunk(&data);
+                if translator.first_delta_received && first_token_time.is_none() {
+                    first_token_time = Some(Instant::now());
+                }
+                // 保存包含 response.completed 的 SSE 事件
+                if translator.completed {
+                    last_completed_data = Some(data.to_vec());
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    let first_token_ms = first_token_time
+        .map(|t| t.duration_since(request_start).as_millis() as i64)
+        .unwrap_or(0);
+    let duration = request_start.elapsed().as_millis() as i64;
+
+    let usage = translator.usage.clone().unwrap_or_else(|| translator.estimate_tokens_on_break());
+    let service_tier = translator.service_tier.clone();
+
+    let endpoint = endpoint.to_string();
+    let model = model.to_string();
+    let email = email.to_string();
+    let effort = reasoning_effort.to_string();
+
+    tokio::spawn({
+        let state = state.clone();
+        let endpoint = endpoint.clone();
+        let model = model.clone();
+        let email = email.clone();
+        let effort = effort.clone();
+        let usage = usage.clone();
+        async move {
+            send_usage_log(
+                &state, account_id, &endpoint, &model,
+                200, duration, false, &email,
+                &usage, first_token_ms, &effort, &service_tier,
+            ).await;
+        }
+    });
+
+    // 从 completed 事件中提取完整响应 JSON 返回给客户端
+    let body_bytes = if let Some(raw) = last_completed_data {
+        // SSE 行格式: "data: {...}\n\n"，提取 JSON 中的 response 字段
+        let text = String::from_utf8_lossy(&raw);
+        let mut result = Vec::new();
+        for line in text.lines() {
+            if let Some(json_str) = line.strip_prefix("data: ") {
+                if let Ok(event) = serde_json::from_str::<Value>(json_str) {
+                    if let Some(resp_obj) = event.get("response") {
+                        result = serde_json::to_vec(resp_obj).unwrap_or_default();
+                        break;
+                    }
+                }
+            }
+        }
+        if result.is_empty() {
+            // 回退：直接用 pending 中缓存的最后完整行
+            b"{}".to_vec()
+        } else {
+            result
+        }
+    } else {
+        b"{}".to_vec()
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .body(Body::from(body_bytes))
         .unwrap()
 }
 

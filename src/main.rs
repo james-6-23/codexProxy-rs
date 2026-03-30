@@ -573,7 +573,7 @@ async fn auto_cleanup_full_usage(state: &AppState) {
     }
 }
 
-/// 过期账号清理（15 分钟）— AT 过期超过 30 分钟
+/// 过期账号清理（15 分钟）— 加入号池超过 30 分钟且未被充分验证的账号
 async fn auto_cleanup_expired(state: &AppState) {
     let enabled = state.db_settings_cache.read()
         .map(|s| s.auto_clean_expired)
@@ -583,21 +583,27 @@ async fn auto_cleanup_expired(state: &AppState) {
     }
 
     let accounts = state.scheduler.all_accounts();
-    let now = chrono::Utc::now();
-    let threshold = now - chrono::Duration::minutes(30);
+    let cutoff = std::time::Instant::now() - std::time::Duration::from_secs(30 * 60);
     let mut cleaned = 0u32;
 
     for acc in &accounts {
-        let rt = acc.refresh_token.read().clone();
-        let expires = *acc.expires_at.read();
-
-        // AT-only 账号（无 refresh_token）且已过期超过 30 分钟
-        if rt.is_empty() && expires < threshold {
-            let _ = db::queries::delete_account(&state.db, acc.db_id).await;
-            state.scheduler.remove_account(acc.db_id);
-            db::queries::insert_account_event(&state.db, acc.db_id, "deleted", "clean_expired").await;
-            cleaned += 1;
+        // 加入时间未超过 30 分钟 → 跳过
+        if acc.created_at > cutoff {
+            continue;
         }
+        // 正在处理请求 → 跳过
+        if acc.active_requests.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            continue;
+        }
+        // 已验证账号（成功请求 > 10 次）→ 跳过
+        if acc.total_requests.load(std::sync::atomic::Ordering::Relaxed) > 10 {
+            continue;
+        }
+
+        let _ = db::queries::delete_account(&state.db, acc.db_id).await;
+        state.scheduler.remove_account(acc.db_id);
+        db::queries::insert_account_event(&state.db, acc.db_id, "deleted", "clean_expired").await;
+        cleaned += 1;
     }
 
     if cleaned > 0 {

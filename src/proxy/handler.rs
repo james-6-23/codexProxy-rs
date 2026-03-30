@@ -491,6 +491,9 @@ async fn stream_response_with_tracking(
             }
         }
 
+        // 冲刷 pending 缓冲（处理流末尾卡在缓冲里的 response.completed）
+        translator.flush_pending();
+
         // 计算指标
         let first_token_ms = first_token_time
             .map(|t| t.duration_since(request_start).as_millis() as i64)
@@ -564,6 +567,9 @@ async fn collect_sync_response(
             Err(_) => break,
         }
     }
+
+    // 冲刷 pending 缓冲
+    translator.flush_pending();
 
     let first_token_ms = first_token_time
         .map(|t| t.duration_since(request_start).as_millis() as i64)

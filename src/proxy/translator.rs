@@ -369,6 +369,47 @@ impl StreamTranslator {
         lines
     }
 
+    /// 流结束后冲刷 pending 缓冲中残留的数据
+    pub fn flush_pending(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let remaining = std::mem::take(&mut self.pending);
+        for line in remaining.lines() {
+            let line = line.trim();
+            if let Some(json_str) = line.strip_prefix("data: ") {
+                if json_str == "[DONE]" {
+                    continue;
+                }
+                if let Ok(event) = serde_json::from_str::<Value>(json_str) {
+                    let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    match event_type {
+                        "response.output_text.delta" => {
+                            self.first_delta_received = true;
+                            self.delta_chars += event
+                                .get("delta")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.len())
+                                .unwrap_or(0);
+                        }
+                        "response.completed" => {
+                            self.completed = true;
+                            if let Some(resp) = event.get("response") {
+                                self.usage = Some(extract_usage(resp));
+                                self.service_tier = resp
+                                    .get("service_tier")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
     /// 翻译一个 SSE chunk，返回翻译后的 bytes
     pub fn translate_chunk(&mut self, data: &[u8]) -> Result<Vec<u8>, anyhow::Error> {
         let text = std::str::from_utf8(data)?;

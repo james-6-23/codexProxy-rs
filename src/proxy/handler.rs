@@ -340,7 +340,7 @@ async fn proxy_request(
                             .unwrap_or(false);
                         if auto_clean {
                             warn!(account_id = account.db_id, "账号 401，自动清理");
-                            let db = state.db.clone();
+                            let db = state.db();
                             let aid = account.db_id;
                             tokio::spawn(async move {
                                 let _ = crate::db::queries::delete_account(&db, aid).await;
@@ -360,7 +360,7 @@ async fn proxy_request(
                             .unwrap_or(false);
                         if auto_clean {
                             warn!(account_id = account.db_id, "账号 429，自动清理");
-                            let db = state.db.clone();
+                            let db = state.db();
                             let aid = account.db_id;
                             tokio::spawn(async move {
                                 let _ = crate::db::queries::delete_account(&db, aid).await;

@@ -109,18 +109,14 @@ async fn main() {
     let (log_tx, log_rx) = tokio::sync::mpsc::channel::<UsageLog>(10000);
 
     // 全局状态
-    let state = Arc::new(AppState {
-        config: config.clone(),
-        db: db_pool.clone(),
+    let state = Arc::new(AppState::new(
+        config.clone(),
+        db_pool.clone(),
         scheduler,
         rate_limiter,
-        token_cache: TokenCache::new(),
-        log_sender: log_tx,
-        settings: tokio::sync::RwLock::new(settings.clone()),
-        db_settings_cache: std::sync::RwLock::new(settings.clone()),
-        start_time: std::time::Instant::now(),
-        http_clients: dashmap::DashMap::new(),
-    });
+        log_tx,
+        settings,
+    ));
 
     // 启动后台任务
     spawn_background_tasks(state.clone(), log_rx);
@@ -287,7 +283,7 @@ fn spawn_background_tasks(
     mut log_rx: tokio::sync::mpsc::Receiver<UsageLog>,
 ) {
     // 1. 使用日志批量写入
-    let db = state.db.clone();
+    let db = state.db();
     tokio::spawn(async move {
         let mut buffer: Vec<UsageLog> = Vec::with_capacity(64);
         // 使用 interval 而非 sleep — interval 不会因 recv 分支触发而重置
@@ -414,7 +410,7 @@ async fn refresh_expiring_tokens(state: &AppState, client: &reqwest::Client) {
 
         let client = client.clone();
         let sem = semaphore.clone();
-        let db = state.db.clone();
+        let db = state.db();
 
         let acc_clone = acc.clone();
         handles.push(tokio::spawn(async move {
@@ -528,9 +524,9 @@ async fn auto_cleanup_sweep(state: &AppState) {
         let rate_limited_clean = settings.auto_clean_rate_limited && acc.is_in_cooldown();
 
         if should_clean || rate_limited_clean {
-            let _ = db::queries::delete_account(&state.db, acc.db_id).await;
+            let _ = db::queries::delete_account(&state.db(), acc.db_id).await;
             state.scheduler.remove_account(acc.db_id);
-            db::queries::insert_account_event(&state.db, acc.db_id, "deleted", "auto_clean").await;
+            db::queries::insert_account_event(&state.db(), acc.db_id, "deleted", "auto_clean").await;
             cleaned += 1;
         }
     }
@@ -561,9 +557,9 @@ async fn auto_cleanup_full_usage(state: &AppState) {
         // 7 天用量 ≥ 100%（存储为 pct * 100 的整数）
         let usage_7d = acc.usage_7d_pct_100.load(std::sync::atomic::Ordering::Relaxed);
         if usage_7d >= 10000 {
-            let _ = db::queries::delete_account(&state.db, acc.db_id).await;
+            let _ = db::queries::delete_account(&state.db(), acc.db_id).await;
             state.scheduler.remove_account(acc.db_id);
-            db::queries::insert_account_event(&state.db, acc.db_id, "deleted", "clean_full_usage").await;
+            db::queries::insert_account_event(&state.db(), acc.db_id, "deleted", "clean_full_usage").await;
             cleaned += 1;
         }
     }
@@ -600,9 +596,9 @@ async fn auto_cleanup_expired(state: &AppState) {
             continue;
         }
 
-        let _ = db::queries::delete_account(&state.db, acc.db_id).await;
+        let _ = db::queries::delete_account(&state.db(), acc.db_id).await;
         state.scheduler.remove_account(acc.db_id);
-        db::queries::insert_account_event(&state.db, acc.db_id, "deleted", "clean_expired").await;
+        db::queries::insert_account_event(&state.db(), acc.db_id, "deleted", "clean_expired").await;
         cleaned += 1;
     }
 

@@ -82,7 +82,7 @@ pub async fn stats(State(state): State<Arc<AppState>>, headers: HeaderMap) -> im
         .filter(|a| a.health_tier.load(Ordering::Relaxed) == scheduler::TIER_BANNED)
         .count();
 
-    let today_requests = queries::count_today_requests(&state.db).await.unwrap_or(0);
+    let today_requests = queries::count_today_requests(&state.db()).await.unwrap_or(0);
 
     Json(json!({
         "total": total,
@@ -223,7 +223,7 @@ pub async fn add_account(
                 req.name
             };
 
-            match queries::insert_account(&state.db, &name, &creds, &req.proxy_url).await {
+            match queries::insert_account(&state.db(), &name, &creds, &req.proxy_url).await {
                 Ok(id) => {
                     let account = Arc::new(Account::new(id));
                     *account.email.write() = info.email;
@@ -235,7 +235,7 @@ pub async fn add_account(
 
                     let email_out = account.email.read().clone();
                     state.scheduler.add_account(account);
-                    queries::insert_account_event(&state.db, id, "added", "manual").await;
+                    queries::insert_account_event(&state.db(), id, "added", "manual").await;
 
                     (
                         StatusCode::CREATED,
@@ -359,7 +359,7 @@ pub async fn add_at_account(
                 req_name.clone()
             };
 
-            match queries::insert_at_account(&state.db, &name, &creds, &proxy_url).await {
+            match queries::insert_at_account(&state.db(), &name, &creds, &proxy_url).await {
                 Ok(id) => {
                     let account = Arc::new(Account::new(id));
                     *account.email.write() = info.email;
@@ -369,7 +369,7 @@ pub async fn add_at_account(
                     *account.codex_account_id.write() = info.chatgpt_account_id;
                     *account.expires_at.write() = expires_at;
                     state.scheduler.add_account(account);
-                    queries::insert_account_event(&state.db, id, "added", "at").await;
+                    queries::insert_account_event(&state.db(), id, "added", "at").await;
                     success_count.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(e) => {
@@ -451,7 +451,7 @@ pub async fn batch_import(
                         ..Default::default()
                     };
 
-                    match queries::insert_account(&state.db, &info.email, &creds, &proxy_url).await {
+                    match queries::insert_account(&state.db(), &info.email, &creds, &proxy_url).await {
                         Ok(id) => {
                             let account = Arc::new(Account::new(id));
                             *account.email.write() = info.email.clone();
@@ -495,7 +495,7 @@ pub async fn delete_account(
         return (code, Json(json!({"error": "unauthorized"}))).into_response();
     }
 
-    if let Err(e) = queries::delete_account(&state.db, id).await {
+    if let Err(e) = queries::delete_account(&state.db(), id).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
@@ -504,7 +504,7 @@ pub async fn delete_account(
     }
 
     state.scheduler.remove_account(id);
-    queries::insert_account_event(&state.db, id, "deleted", "manual").await;
+    queries::insert_account_event(&state.db(), id, "deleted", "manual").await;
     Json(json!({"message": "ok"})).into_response()
 }
 
@@ -520,12 +520,12 @@ pub async fn batch_delete_accounts(
 
     let mut deleted = 0i64;
     if !req.ids.is_empty() {
-        if let Ok(n) = queries::batch_delete_accounts(&state.db, &req.ids).await {
+        if let Ok(n) = queries::batch_delete_accounts(&state.db(), &req.ids).await {
             deleted = n;
         }
         for id in &req.ids {
             state.scheduler.remove_account(*id);
-            queries::insert_account_event(&state.db, *id, "deleted", "batch").await;
+            queries::insert_account_event(&state.db(), *id, "deleted", "batch").await;
         }
     }
 
@@ -605,7 +605,7 @@ pub async fn account_usage(
         return (code, Json(json!({"error": "unauthorized"}))).into_response();
     }
 
-    match queries::get_account_usage(&state.db, id).await {
+    match queries::get_account_usage(&state.db(), id).await {
         Ok(detail) => Json(json!(detail)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -844,7 +844,7 @@ pub async fn usage_stats(
         return (code, Json(json!({"error": "unauthorized"}))).into_response();
     }
 
-    match queries::get_usage_stats_full(&state.db).await {
+    match queries::get_usage_stats_full(&state.db()).await {
         Ok(stats) => Json(json!(stats)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -903,7 +903,7 @@ pub async fn chart_data(
         (60, 5)
     };
 
-    match queries::query_chart_data(&state.db, range_minutes, bucket_minutes).await {
+    match queries::query_chart_data(&state.db(), range_minutes, bucket_minutes).await {
         Ok(data) => Json(json!(data)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -954,7 +954,7 @@ pub async fn usage_logs(
     });
 
     match queries::query_usage_logs(
-        &state.db,
+        &state.db(),
         q.page,
         q.page_size,
         q.model.as_deref(),
@@ -984,7 +984,7 @@ pub async fn clear_usage_logs(
         return (code, Json(json!({"error": "unauthorized"}))).into_response();
     }
 
-    match queries::clear_usage_logs(&state.db).await {
+    match queries::clear_usage_logs(&state.db()).await {
         Ok(_) => Json(json!({"message": "ok"})).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1018,7 +1018,7 @@ pub async fn ops_overview(
     let uptime = state.start_time.elapsed().as_secs();
 
     // 流量统计（RPM、TPM、today_tokens、error_rate）
-    let usage = queries::get_usage_stats_full(&state.db).await.ok();
+    let usage = queries::get_usage_stats_full(&state.db()).await.ok();
     let today_requests = usage.as_ref().map(|u| u.today_requests).unwrap_or(0);
     let today_tokens = usage.as_ref().map(|u| u.today_tokens).unwrap_or(0);
     let rpm = usage.as_ref().map(|u| u.rpm as f64).unwrap_or(0.0);
@@ -1029,8 +1029,9 @@ pub async fn ops_overview(
     let (cpu_percent, mem_percent, mem_used, mem_total, process_mem) = get_sys_metrics();
 
     // PostgreSQL 连接池
-    let pool_size = state.db.size() as i64;
-    let pool_idle = state.db.num_idle() as i64;
+    let db = state.db();
+    let pool_size = db.size() as i64;
+    let pool_idle = db.num_idle() as i64;
     let pool_in_use = pool_size - pool_idle;
     let pool_max = {
         let s = state.db_settings_cache.read().unwrap();
@@ -1129,7 +1130,7 @@ pub async fn get_settings(
         return (code, Json(json!({"error": "unauthorized"}))).into_response();
     }
 
-    match queries::get_system_settings(&state.db).await {
+    match queries::get_system_settings(&state.db()).await {
         Ok(s) => {
             // 前端需要更多字段
             let admin_auth_source = if state.config.admin_secret.is_some() {
@@ -1185,7 +1186,7 @@ pub async fn update_settings(
     }
 
     // 加载当前设置并合并前端发来的字段
-    let mut settings = match queries::get_system_settings(&state.db).await {
+    let mut settings = match queries::get_system_settings(&state.db()).await {
         Ok(s) => s,
         Err(e) => {
             return (
@@ -1233,7 +1234,7 @@ pub async fn update_settings(
         settings.fast_scheduler_enabled = v;
     }
 
-    if let Err(e) = queries::update_system_settings(&state.db, &settings).await {
+    if let Err(e) = queries::update_system_settings(&state.db(), &settings).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
@@ -1247,6 +1248,22 @@ pub async fn update_settings(
         .max_concurrency
         .store(settings.max_concurrency as i64, Ordering::Relaxed);
     state.rate_limiter.set_rpm(settings.global_rpm as i64);
+
+    // 动态修改 PG 连接池大小
+    let old_max = state.db().size() as i32;
+    let new_max = settings.pg_max_conns.clamp(5, 500);
+    if new_max != old_max as i32 {
+        match crate::db::init(&state.config.database_url, new_max as u32).await {
+            Ok(new_pool) => {
+                state.replace_db(new_pool);
+                tracing::info!(old = old_max, new = new_max, "PG 连接池已动态调整");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "PG 连接池替换失败");
+            }
+        }
+    }
+
     *state.db_settings_cache.write().unwrap() = settings;
     state.scheduler.recompute_all();
 
@@ -1265,7 +1282,7 @@ pub async fn list_keys(
         return (code, Json(json!({"error": "unauthorized"}))).into_response();
     }
 
-    match queries::list_api_keys(&state.db).await {
+    match queries::list_api_keys(&state.db()).await {
         Ok(keys) => Json(json!({"keys": keys})).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1296,7 +1313,7 @@ pub async fn create_key(
         .filter(|k| !k.is_empty())
         .unwrap_or_else(|| format!("sk-{}", uuid::Uuid::new_v4().to_string().replace('-', "")));
 
-    match queries::insert_api_key(&state.db, &req.name, &key).await {
+    match queries::insert_api_key(&state.db(), &req.name, &key).await {
         Ok(id) => (
             StatusCode::CREATED,
             Json(json!({"id": id, "key": key, "name": req.name})),
@@ -1320,7 +1337,7 @@ pub async fn delete_key(
         return (code, Json(json!({"error": "unauthorized"}))).into_response();
     }
 
-    match queries::delete_api_key(&state.db, id).await {
+    match queries::delete_api_key(&state.db(), id).await {
         Ok(_) => Json(json!({"message": "ok"})).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1360,9 +1377,9 @@ pub async fn clean_banned(
     let mut cleaned = 0;
     for acc in &accounts {
         if acc.health_tier.load(Ordering::Relaxed) == scheduler::TIER_BANNED {
-            let _ = queries::delete_account(&state.db, acc.db_id).await;
+            let _ = queries::delete_account(&state.db(), acc.db_id).await;
             state.scheduler.remove_account(acc.db_id);
-            queries::insert_account_event(&state.db, acc.db_id, "deleted", "clean_banned").await;
+            queries::insert_account_event(&state.db(), acc.db_id, "deleted", "clean_banned").await;
             cleaned += 1;
         }
     }
@@ -1382,9 +1399,9 @@ pub async fn clean_rate_limited(
     let mut cleaned = 0;
     for acc in &accounts {
         if acc.is_in_cooldown() {
-            let _ = queries::delete_account(&state.db, acc.db_id).await;
+            let _ = queries::delete_account(&state.db(), acc.db_id).await;
             state.scheduler.remove_account(acc.db_id);
-            queries::insert_account_event(&state.db, acc.db_id, "deleted", "clean_rate_limited").await;
+            queries::insert_account_event(&state.db(), acc.db_id, "deleted", "clean_rate_limited").await;
             cleaned += 1;
         }
     }
@@ -1405,9 +1422,9 @@ pub async fn clean_error(
     for acc in &accounts {
         let tier = acc.health_tier.load(Ordering::Relaxed);
         if tier == scheduler::TIER_BANNED || tier == scheduler::TIER_RISKY {
-            let _ = queries::delete_account(&state.db, acc.db_id).await;
+            let _ = queries::delete_account(&state.db(), acc.db_id).await;
             state.scheduler.remove_account(acc.db_id);
-            queries::insert_account_event(&state.db, acc.db_id, "deleted", "clean_error").await;
+            queries::insert_account_event(&state.db(), acc.db_id, "deleted", "clean_error").await;
             cleaned += 1;
         }
     }
@@ -1516,7 +1533,7 @@ async fn import_at_txt(
     }
 
     // 数据库去重
-    let existing = queries::get_all_access_tokens(&state.db).await.unwrap_or_default();
+    let existing = queries::get_all_access_tokens(&state.db()).await.unwrap_or_default();
     let mut new_tokens: Vec<String> = Vec::new();
     let mut duplicate_count = 0usize;
     for at in &tokens {
@@ -1581,7 +1598,7 @@ async fn import_at_txt(
                     info.email.clone()
                 };
 
-                match queries::insert_at_account(&state.db, &name, &creds, &proxy_url).await {
+                match queries::insert_at_account(&state.db(), &name, &creds, &proxy_url).await {
                     Ok(id) => {
                         let account = Arc::new(Account::new(id));
                         *account.email.write() = info.email;
@@ -1665,7 +1682,7 @@ async fn import_rt_txt(
     }
 
     // 数据库去重
-    let existing = queries::get_all_refresh_tokens(&state.db).await.unwrap_or_default();
+    let existing = queries::get_all_refresh_tokens(&state.db()).await.unwrap_or_default();
     let mut new_tokens: Vec<String> = Vec::new();
     let mut duplicate_count = 0usize;
     for rt in &tokens {
@@ -1730,7 +1747,7 @@ async fn import_rt_txt(
                         };
 
                         let name = if info.email.is_empty() { rt[..8.min(rt.len())].to_string() } else { info.email.clone() };
-                        if let Ok(id) = queries::insert_account(&state.db, &name, &creds, &proxy_url).await {
+                        if let Ok(id) = queries::insert_account(&state.db(), &name, &creds, &proxy_url).await {
                             let account = Arc::new(Account::new(id));
                             *account.email.write() = info.email;
                             *account.plan_type.write() = info.chatgpt_plan_type;
@@ -1850,7 +1867,7 @@ pub async fn account_event_trend(
         .and_then(|v| v.parse().ok())
         .unwrap_or(60);
 
-    match queries::get_account_event_trend(&state.db, &start, &end, bucket_minutes).await {
+    match queries::get_account_event_trend(&state.db(), &start, &end, bucket_minutes).await {
         Ok(points) => Json(json!({"points": points})).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

@@ -49,6 +49,9 @@ sha2 = "0.10"
 # 前端嵌入
 include_dir = "0.7"
 
+# 系统监控
+sysinfo = "0.35"
+
 [profile.release]
 opt-level = 3
 lto = true

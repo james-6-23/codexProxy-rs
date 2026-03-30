@@ -9,12 +9,17 @@ pub async fn refresh_access_token(
     client: &Client,
     refresh_token: &str,
 ) -> Result<TokenResponse> {
+    let rt = refresh_token.trim();
+    if rt.is_empty() {
+        bail!("non_retryable: refresh_token 为空");
+    }
+
     let resp = client
         .post(TOKEN_URL)
         .form(&[
             ("grant_type", "refresh_token"),
             ("client_id", CLIENT_ID),
-            ("refresh_token", refresh_token),
+            ("refresh_token", rt),
             ("scope", REFRESH_SCOPES),
         ])
         .timeout(Duration::from_secs(10))
@@ -43,10 +48,15 @@ pub async fn refresh_with_retry(
     client: &Client,
     refresh_token: &str,
 ) -> Result<TokenResponse> {
+    let rt = refresh_token.trim();
+    if rt.is_empty() {
+        bail!("non_retryable: refresh_token 为空，跳过刷新");
+    }
+
     let mut last_err = None;
 
     for attempt in 0..3 {
-        match refresh_access_token(client, refresh_token).await {
+        match refresh_access_token(client, rt).await {
             Ok(resp) => return Ok(resp),
             Err(e) => {
                 let msg = e.to_string();

@@ -14,11 +14,16 @@ pub const CLIENT_VERSION: &str = "0.117.0";
 
 /// 支持的模型列表
 pub const SUPPORTED_MODELS: &[&str] = &[
-    "o4-mini",
-    "o3",
-    "o3-pro",
-    "gpt-4.1",
-    "gpt-4.1-mini",
-    "gpt-4.1-nano",
-    "codex-mini",
+    "gpt-5.4",
+    "gpt-5.4-mini",
+    "gpt-5",
+    "gpt-5-codex",
+    "gpt-5-codex-mini",
+    "gpt-5.1",
+    "gpt-5.1-codex",
+    "gpt-5.1-codex-mini",
+    "gpt-5.1-codex-max",
+    "gpt-5.2",
+    "gpt-5.2-codex",
+    "gpt-5.3-codex",
 ];

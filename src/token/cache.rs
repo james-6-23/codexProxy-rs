@@ -69,6 +69,11 @@ impl TokenCache {
         self.refresh_locks.remove(&account_id);
     }
 
+    /// 缓存条目数量
+    pub fn len(&self) -> usize {
+        self.tokens.len()
+    }
+
     /// 清理过期条目
     pub fn cleanup_expired(&self) {
         let now = Instant::now();

@@ -344,58 +344,126 @@ pub async fn add_at_account(
         return (code, Json(json!({"error": "unauthorized"}))).into_response();
     }
 
-    let info = token::parse_id_token(&req.access_token).unwrap_or_default();
-
-    // 从 JWT 解析过期时间，默认 1 小时
-    let expires_at = if info.expires_at > 0 {
-        chrono::DateTime::from_timestamp(info.expires_at, 0)
-            .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::hours(1))
-    } else {
-        chrono::Utc::now() + chrono::Duration::hours(1)
-    };
-
-    let creds = Credentials {
-        access_token: req.access_token.clone(),
-        email: info.email.clone(),
-        account_id: info.chatgpt_account_id.clone(),
-        plan_type: info.chatgpt_plan_type.clone(),
-        expires_at: expires_at.to_rfc3339(),
-        ..Default::default()
-    };
-
-    let name = if req.name.is_empty() {
-        if info.email.is_empty() {
-            "AT-only".to_string()
-        } else {
-            info.email.clone()
-        }
-    } else {
-        req.name
-    };
-
-    match queries::insert_at_account(&state.db, &name, &creds, &req.proxy_url).await {
-        Ok(id) => {
-            let account = Arc::new(Account::new(id));
-            *account.email.write() = info.email;
-            *account.plan_type.write() = info.chatgpt_plan_type;
-            *account.proxy_url.write() = req.proxy_url;
-            *account.access_token.write() = req.access_token;
-            *account.codex_account_id.write() = info.chatgpt_account_id;
-            *account.expires_at.write() = expires_at;
-            state.scheduler.add_account(account);
-
-            (
-                StatusCode::CREATED,
-                Json(json!({"message": "ok", "id": id})),
-            )
-                .into_response()
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": e.to_string()})),
+    if req.access_token.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "access_token 是必填字段"})),
         )
-            .into_response(),
+            .into_response();
     }
+
+    // 按行分割，支持批量添加
+    let tokens: Vec<String> = req
+        .access_token
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    if tokens.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "未找到有效的 Access Token"})),
+        )
+            .into_response();
+    }
+
+    if tokens.len() > 500 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "单次最多添加 500 个账号"})),
+        )
+            .into_response();
+    }
+
+    let total = tokens.len();
+    let success_count = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let fail_count = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let sem = Arc::new(tokio::sync::Semaphore::new(20));
+    let req_name = req.name.clone();
+    let proxy_url = req.proxy_url.clone();
+
+    let mut handles = Vec::with_capacity(total);
+
+    for (i, at) in tokens.into_iter().enumerate() {
+        let sem = sem.clone();
+        let state = state.clone();
+        let success_count = success_count.clone();
+        let fail_count = fail_count.clone();
+        let req_name = req_name.clone();
+        let proxy_url = proxy_url.clone();
+
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+
+            let info = token::parse_id_token(&at).unwrap_or_default();
+
+            let expires_at = if info.expires_at > 0 {
+                chrono::DateTime::from_timestamp(info.expires_at, 0)
+                    .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::hours(1))
+            } else {
+                chrono::Utc::now() + chrono::Duration::hours(1)
+            };
+
+            let creds = Credentials {
+                access_token: at.clone(),
+                email: info.email.clone(),
+                account_id: info.chatgpt_account_id.clone(),
+                plan_type: info.chatgpt_plan_type.clone(),
+                expires_at: expires_at.to_rfc3339(),
+                ..Default::default()
+            };
+
+            let name = if req_name.is_empty() {
+                if info.email.is_empty() {
+                    format!("at-account-{}", i + 1)
+                } else {
+                    info.email.clone()
+                }
+            } else if total > 1 {
+                format!("{}-{}", req_name, i + 1)
+            } else {
+                req_name.clone()
+            };
+
+            match queries::insert_at_account(&state.db, &name, &creds, &proxy_url).await {
+                Ok(id) => {
+                    let account = Arc::new(Account::new(id));
+                    *account.email.write() = info.email;
+                    *account.plan_type.write() = info.chatgpt_plan_type;
+                    *account.proxy_url.write() = proxy_url;
+                    *account.access_token.write() = at;
+                    *account.codex_account_id.write() = info.chatgpt_account_id;
+                    *account.expires_at.write() = expires_at;
+                    state.scheduler.add_account(account);
+                    success_count.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    tracing::warn!(index = i + 1, error = %e, "AT 账号添加失败");
+                    fail_count.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }));
+    }
+
+    for h in handles {
+        let _ = h.await;
+    }
+
+    let success = success_count.load(Ordering::Relaxed);
+    let failed = fail_count.load(Ordering::Relaxed);
+    let msg = if failed > 0 {
+        format!("成功添加 {} 个 AT 账号，{} 个失败", success, failed)
+    } else {
+        format!("成功添加 {} 个 AT 账号", success)
+    };
+
+    Json(json!({
+        "message": msg,
+        "success": success,
+        "failed": failed,
+    }))
+    .into_response()
 }
 
 /// POST /api/admin/accounts/batch
@@ -829,10 +897,32 @@ pub async fn ops_overview(
         .map(|a| a.total_requests.load(Ordering::Relaxed))
         .sum();
 
-    let today_requests = queries::count_today_requests(&state.db).await.unwrap_or(0);
-
-    // Rust 没有 goroutines，用 tokio metrics 代替
     let uptime = state.start_time.elapsed().as_secs();
+
+    // 流量统计（RPM、TPM、today_tokens、error_rate）
+    let usage = queries::get_usage_stats_full(&state.db).await.ok();
+    let today_requests = usage.as_ref().map(|u| u.today_requests).unwrap_or(0);
+    let today_tokens = usage.as_ref().map(|u| u.today_tokens).unwrap_or(0);
+    let rpm = usage.as_ref().map(|u| u.rpm as f64).unwrap_or(0.0);
+    let tpm = usage.as_ref().map(|u| u.tpm as f64).unwrap_or(0.0);
+    let error_rate = usage.as_ref().map(|u| u.error_rate).unwrap_or(0.0);
+
+    // CPU & 内存
+    let (cpu_percent, mem_percent, mem_used, mem_total) = get_sys_metrics();
+
+    // PostgreSQL 连接池
+    let pool_size = state.db.size() as i64;
+    let pool_idle = state.db.num_idle() as i64;
+    let pool_in_use = pool_size - pool_idle;
+    let pool_max = state.config.db_pool_size as i64;
+    let pg_usage = if pool_max > 0 { pool_in_use as f64 / pool_max as f64 * 100.0 } else { 0.0 };
+
+    // in-process 缓存（内存缓存，始终健康）
+    let cache_size = state.token_cache.len() as i64;
+
+    // RPM 限额
+    let settings = state.db_settings_cache.read().unwrap();
+    let rpm_limit = settings.global_rpm as i64;
 
     Json(json!({
         "updated_at": chrono::Utc::now().to_rfc3339(),
@@ -841,8 +931,8 @@ pub async fn ops_overview(
         "database_label": "PostgreSQL",
         "cache_driver": "memory",
         "cache_label": "in-process",
-        "cpu": { "percent": 0.0, "cores": num_cpus() },
-        "memory": { "percent": 0.0, "used_bytes": 0, "total_bytes": 0 },
+        "cpu": { "percent": cpu_percent, "cores": num_cpus() },
+        "memory": { "percent": mem_percent, "used_bytes": mem_used, "total_bytes": mem_total },
         "runtime": {
             "goroutines": tokio::runtime::Handle::current().metrics().num_alive_tasks(),
             "available_accounts": state.scheduler.available_count(),
@@ -854,25 +944,46 @@ pub async fn ops_overview(
         },
         "postgres": {
             "healthy": true,
-            "open": 0, "in_use": 0, "idle": 0, "max_open": 8,
-            "wait_count": 0, "usage_percent": 0.0,
+            "open": pool_size, "in_use": pool_in_use, "idle": pool_idle,
+            "max_open": pool_max,
+            "wait_count": 0, "usage_percent": pg_usage,
         },
         "redis": {
-            "healthy": false,
-            "total_conns": 0, "idle_conns": 0, "stale_conns": 0,
-            "pool_size": 0, "usage_percent": 0.0,
+            "healthy": true,
+            "total_conns": cache_size, "idle_conns": 0, "stale_conns": 0,
+            "pool_size": cache_size, "usage_percent": 0.0,
         },
         "traffic": {
-            "qps": 0.0, "qps_peak": 0.0,
-            "tps": 0.0, "tps_peak": 0.0,
-            "rpm": 0.0, "tpm": 0.0,
-            "error_rate": 0.0,
+            "qps": rpm / 60.0, "qps_peak": 0.0,
+            "tps": tpm / 60.0, "tps_peak": 0.0,
+            "rpm": rpm, "tpm": tpm,
+            "error_rate": error_rate,
             "today_requests": today_requests,
-            "today_tokens": 0,
-            "rpm_limit": state.scheduler.max_concurrency.load(Ordering::Relaxed),
+            "today_tokens": today_tokens,
+            "rpm_limit": rpm_limit,
         },
     }))
     .into_response()
+}
+
+/// 获取 CPU 和内存指标
+fn get_sys_metrics() -> (f64, f64, u64, u64) {
+    use sysinfo::System;
+    let mut sys = System::new();
+    sys.refresh_memory();
+    sys.refresh_cpu_usage();
+
+    let mem_total = sys.total_memory();
+    let mem_used = sys.used_memory();
+    let mem_percent = if mem_total > 0 {
+        mem_used as f64 / mem_total as f64 * 100.0
+    } else {
+        0.0
+    };
+
+    let cpu_percent = sys.global_cpu_usage() as f64;
+
+    (cpu_percent, mem_percent, mem_used, mem_total)
 }
 
 fn num_cpus() -> usize {

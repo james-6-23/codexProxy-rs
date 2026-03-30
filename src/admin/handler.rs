@@ -944,21 +944,16 @@ pub async fn usage_logs(
         return (code, Json(json!({"error": "unauthorized"}))).into_response();
     }
 
-    let range_minutes = q.range.as_deref().map(|r| match r {
-        "1h" => 60,
-        "6h" => 360,
-        "24h" => 1440,
-        "7d" => 10080,
-        "30d" => 43200,
-        _ => 60,
-    });
-
-    match queries::query_usage_logs(
+    match queries::query_usage_logs_filtered(
         &state.db(),
         q.page,
         q.page_size,
         q.model.as_deref(),
-        range_minutes,
+        q.email.as_deref(),
+        q.endpoint.as_deref(),
+        q.stream.as_deref(),
+        q.start.as_deref(),
+        q.end.as_deref(),
     )
     .await
     {

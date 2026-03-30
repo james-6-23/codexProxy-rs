@@ -198,26 +198,70 @@ pub async fn query_chart_data(pool: &DbPool, range_minutes: i64, bucket_minutes:
 }
 
 /// 查询使用日志（分页）
-pub async fn query_usage_logs(
+/// 带完整筛选的使用日志查询
+pub async fn query_usage_logs_filtered(
     pool: &DbPool,
     page: i64,
     page_size: i64,
-    model_filter: Option<&str>,
-    range_minutes: Option<i64>,
+    model: Option<&str>,
+    email: Option<&str>,
+    endpoint: Option<&str>,
+    stream: Option<&str>,
+    start: Option<&str>,
+    end: Option<&str>,
 ) -> Result<(Vec<UsageLogRow>, i64)> {
     let offset = (page - 1) * page_size;
 
-    // 动态构建查询
     let mut where_clauses = vec!["status_code != 499".to_string()];
-    let mut param_idx = 1u32;
+    let mut bind_values: Vec<String> = Vec::new();
+    let mut param_idx = 0u32;
 
-    if model_filter.is_some() {
+    // 时间范围
+    if let Some(s) = start {
         param_idx += 1;
-        where_clauses.push(format!("model = ${}", param_idx));
+        where_clauses.push(format!("created_at >= ${}::TIMESTAMPTZ", param_idx));
+        bind_values.push(s.to_string());
     }
-    if range_minutes.is_some() {
+    if let Some(e) = end {
         param_idx += 1;
-        where_clauses.push(format!("created_at >= NOW() - (${}::TEXT || ' minutes')::INTERVAL", param_idx));
+        where_clauses.push(format!("created_at <= ${}::TIMESTAMPTZ", param_idx));
+        bind_values.push(e.to_string());
+    }
+
+    // 模型
+    if let Some(m) = model {
+        if !m.is_empty() {
+            param_idx += 1;
+            where_clauses.push(format!("model = ${}", param_idx));
+            bind_values.push(m.to_string());
+        }
+    }
+
+    // 邮箱（模糊匹配）
+    if let Some(em) = email {
+        if !em.is_empty() {
+            param_idx += 1;
+            where_clauses.push(format!("LOWER(account_email) LIKE LOWER(${})", param_idx));
+            bind_values.push(format!("%{}%", em));
+        }
+    }
+
+    // 端点
+    if let Some(ep) = endpoint {
+        if !ep.is_empty() {
+            param_idx += 1;
+            where_clauses.push(format!("endpoint = ${}", param_idx));
+            bind_values.push(ep.to_string());
+        }
+    }
+
+    // 流式/非流式
+    if let Some(s) = stream {
+        match s {
+            "true" => where_clauses.push("stream = true".to_string()),
+            "false" => where_clauses.push("stream = false".to_string()),
+            _ => {}
+        }
     }
 
     let where_sql = where_clauses.join(" AND ");
@@ -225,11 +269,8 @@ pub async fn query_usage_logs(
     // 总数
     let count_sql = format!("SELECT COUNT(*)::BIGINT FROM usage_logs WHERE {}", where_sql);
     let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql);
-    if let Some(m) = model_filter {
-        count_q = count_q.bind(m);
-    }
-    if let Some(mins) = range_minutes {
-        count_q = count_q.bind(mins.to_string());
+    for v in &bind_values {
+        count_q = count_q.bind(v);
     }
     let total = count_q.fetch_one(pool).await?;
 
@@ -243,11 +284,8 @@ pub async fn query_usage_logs(
         where_sql, page_size, offset
     );
     let mut data_q = sqlx::query_as::<_, UsageLogRow>(&data_sql);
-    if let Some(m) = model_filter {
-        data_q = data_q.bind(m);
-    }
-    if let Some(mins) = range_minutes {
-        data_q = data_q.bind(mins.to_string());
+    for v in &bind_values {
+        data_q = data_q.bind(v);
     }
     let logs = data_q.fetch_all(pool).await?;
 

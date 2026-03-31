@@ -1817,7 +1817,10 @@ async fn import_json(
 
     #[derive(Deserialize)]
     struct JsonEntry {
+        #[serde(default)]
         refresh_token: String,
+        #[serde(default)]
+        access_token: String,
         #[serde(default)]
         email: String,
     }
@@ -1830,17 +1833,38 @@ async fn import_json(
         return Json(json!({"error": "不是有效的 JSON 格式"})).into_response();
     };
 
-    let tokens: Vec<String> = entries
-        .into_iter()
-        .map(|e| e.refresh_token.trim().to_string())
-        .filter(|t| !t.is_empty())
-        .collect();
+    // 按 token 类型分流：有 refresh_token 走 RT 导入，否则有 access_token 走 AT 导入
+    let mut rt_tokens: Vec<String> = Vec::new();
+    let mut at_tokens: Vec<String> = Vec::new();
 
-    if tokens.is_empty() {
-        return Json(json!({"error": "JSON 文件中未找到有效的 refresh_token"})).into_response();
+    for e in entries {
+        let rt = e.refresh_token.trim().to_string();
+        let at = e.access_token.trim().to_string();
+        if !rt.is_empty() {
+            rt_tokens.push(rt);
+        } else if !at.is_empty() {
+            at_tokens.push(at);
+        }
     }
 
-    import_rt_txt(state, tokens.join("\n").into_bytes(), proxy_url).await
+    if rt_tokens.is_empty() && at_tokens.is_empty() {
+        return Json(json!({"error": "JSON 文件中未找到有效的 refresh_token 或 access_token"})).into_response();
+    }
+
+    // 优先处理 RT（需要刷新验证），AT-only 直接导入
+    if !rt_tokens.is_empty() && at_tokens.is_empty() {
+        // 全部是 RT
+        import_rt_txt(state, rt_tokens.join("\n").into_bytes(), proxy_url).await
+    } else if rt_tokens.is_empty() && !at_tokens.is_empty() {
+        // 全部是 AT-only
+        import_at_txt(state, at_tokens.join("\n").into_bytes(), proxy_url).await
+    } else {
+        // 混合模式：先导入 RT，再导入 AT
+        // 为简化 SSE 流处理，合并为两批串行执行
+        // RT 优先（数量通常较少且需要网络验证）
+        import_rt_txt(state.clone(), rt_tokens.join("\n").into_bytes(), proxy_url.clone()).await;
+        import_at_txt(state, at_tokens.join("\n").into_bytes(), proxy_url).await
+    }
 }
 
 // ─── 账号事件趋势 ───

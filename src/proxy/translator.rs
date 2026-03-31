@@ -327,6 +327,8 @@ pub struct StreamTranslator {
     pub first_delta_received: bool,
     /// 是否收到了终止事件
     pub completed: bool,
+    /// 上游流是否异常中断（网络错误、未收到 completed 就结束）
+    pub stream_broken: bool,
     /// 累积 delta 字符数（用于 token 估算）
     pub delta_chars: usize,
     /// 从 response.completed 提取的 usage
@@ -344,6 +346,7 @@ impl StreamTranslator {
             next_tool_index: 0,
             first_delta_received: false,
             completed: false,
+            stream_broken: false,
             delta_chars: 0,
             usage: None,
             service_tier: String::new(),
@@ -356,14 +359,18 @@ impl StreamTranslator {
     fn drain_lines(&mut self, new_data: &str) -> Vec<String> {
         self.pending.push_str(new_data);
         let mut lines = Vec::new();
+        let mut start = 0;
 
-        loop {
-            let Some(pos) = self.pending.find('\n') else {
-                break;
-            };
-            let line = self.pending[..pos].trim_end_matches('\r').to_string();
-            self.pending = self.pending[pos + 1..].to_string();
+        while let Some(rel_pos) = self.pending[start..].find('\n') {
+            let end = start + rel_pos;
+            let line = self.pending[start..end].trim_end_matches('\r').to_string();
             lines.push(line);
+            start = end + 1;
+        }
+
+        // 一次性截断已消费部分，避免反复重建 pending
+        if start > 0 {
+            self.pending.drain(..start);
         }
 
         lines

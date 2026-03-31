@@ -7,7 +7,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use serde_json::Value;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
@@ -173,6 +173,7 @@ async fn proxy_request(
         let upstream_url = format!("{}/responses", super::UPSTREAM_BASE);
         let ua = crate::proxy::useragent::ua_for_account(&account_id_str);
         let version = crate::proxy::useragent::version_from_ua(ua);
+        let (stainless_os, stainless_arch) = crate::proxy::useragent::platform_from_ua(ua);
         let client = get_or_create_client(&state, &proxy_url);
 
         let mut req = client
@@ -186,10 +187,10 @@ async fn proxy_request(
             .header("Connection", "Keep-Alive")
             .header("X-Stainless-Package-Version", version)
             .header("X-Stainless-Runtime-Version", version)
-            .header("X-Stainless-Os", "MacOS")
-            .header("X-Stainless-Arch", "arm64")
+            .header("X-Stainless-Os", stainless_os)
+            .header("X-Stainless-Arch", stainless_arch)
             .json(&upstream_body)
-            .timeout(Duration::from_secs(120));
+            .timeout(Duration::from_secs(600));
 
         if !codex_account_id.is_empty() {
             req = req.header("Chatgpt-Account-Id", &codex_account_id);
@@ -227,19 +228,54 @@ async fn proxy_request(
                     );
 
                     if is_stream || translate {
-                        // 流式转发 — 带 TTFT 追踪 + usage 提取 + 客户端断连检测
-                        return stream_response_with_tracking(
-                            resp,
-                            translate,
-                            state.clone(),
-                            account.db_id,
-                            endpoint,
-                            &model,
-                            &account_email,
-                            &reasoning_effort,
-                            start,
-                        )
-                        .await;
+                        // Peek 第一个 chunk — 在返回 SSE 响应之前验证上游是否真正开始输出
+                        let mut stream = resp.bytes_stream();
+                        match peek_first_chunk(&mut stream).await {
+                            PeekResult::Data(first_chunk) => {
+                                // 成功拿到第一个 chunk，构建 SSE 响应
+                                return stream_response_with_tracking(
+                                    first_chunk,
+                                    stream,
+                                    translate,
+                                    state.clone(),
+                                    account.db_id,
+                                    endpoint,
+                                    &model,
+                                    &account_email,
+                                    &reasoning_effort,
+                                    start,
+                                )
+                                .await;
+                            }
+                            PeekResult::UpstreamError(err_text) => {
+                                // 首字节前上游返回了 SSE 错误事件 → bootstrap retry
+                                warn!(
+                                    account_id = account.db_id,
+                                    "首 chunk 为错误事件，bootstrap retry: {}",
+                                    err_text.chars().take(200).collect::<String>()
+                                );
+                                exclude_set.insert(account.db_id);
+                                last_error = err_text;
+                                state.scheduler.notify_available();
+                                continue;
+                            }
+                            PeekResult::Empty => {
+                                // 空流 — 上游立即关闭
+                                warn!(account_id = account.db_id, "上游返回空流");
+                                exclude_set.insert(account.db_id);
+                                last_error = "上游返回空流".to_string();
+                                state.scheduler.notify_available();
+                                continue;
+                            }
+                            PeekResult::NetworkError(e) => {
+                                // 网络层错误 → bootstrap retry
+                                warn!(account_id = account.db_id, error = %e, "peek 阶段网络错误");
+                                exclude_set.insert(account.db_id);
+                                last_error = format!("peek 网络错误: {}", e);
+                                state.scheduler.notify_available();
+                                continue;
+                            }
+                        }
                     } else {
                         // sync 模式（Codex 仍返回 SSE，需读取流提取完整响应 + usage）
                         return collect_sync_response(
@@ -286,24 +322,13 @@ async fn proxy_request(
                     );
                 }
 
-                // 记录错误请求日志
-                {
-                    let s = state.clone();
-                    let ep = endpoint.to_string();
-                    let m = model.clone();
-                    let em = account_email.clone();
-                    let ef = reasoning_effort.clone();
-                    let aid = account.db_id;
-                    let sc = status_u16 as i64;
-                    tokio::spawn(async move {
-                        send_usage_log(
-                            &s, aid, &ep, &m,
-                            sc, duration, is_stream, &em,
-                            &UsageInfo { input_tokens: 0, output_tokens: 0, reasoning_tokens: 0, cached_tokens: 0, total_tokens: 0 },
-                            0, &ef, "",
-                        ).await;
-                    });
-                }
+                // 记录错误请求日志（直接 send 到 log channel，无需 spawn）
+                send_usage_log(
+                    &state, account.db_id, endpoint, &model,
+                    status_u16 as i64, duration, is_stream, &account_email,
+                    &UsageInfo { input_tokens: 0, output_tokens: 0, reasoning_tokens: 0, cached_tokens: 0, total_tokens: 0 },
+                    0, &reasoning_effort, "",
+                ).await;
 
                 match status_u16 {
                     401 => {
@@ -379,24 +404,14 @@ async fn proxy_request(
                 exclude_set.insert(account.db_id);
                 last_error = format!("{}", e);
 
-                // 记录网络/超时错误日志（status_code=499 表示客户端连接错误）
+                // 记录网络/超时错误日志（直接 send，无需 spawn）
                 let duration = request_start.elapsed().as_millis() as i64;
-                {
-                    let s = state.clone();
-                    let ep = endpoint.to_string();
-                    let m = model.clone();
-                    let em = account_email.clone();
-                    let ef = reasoning_effort.clone();
-                    let aid = account.db_id;
-                    tokio::spawn(async move {
-                        send_usage_log(
-                            &s, aid, &ep, &m,
-                            499, duration, is_stream, &em,
-                            &UsageInfo { input_tokens: 0, output_tokens: 0, reasoning_tokens: 0, cached_tokens: 0, total_tokens: 0 },
-                            0, &ef, "",
-                        ).await;
-                    });
-                }
+                send_usage_log(
+                    &state, account.db_id, endpoint, &model,
+                    499, duration, is_stream, &account_email,
+                    &UsageInfo { input_tokens: 0, output_tokens: 0, reasoning_tokens: 0, cached_tokens: 0, total_tokens: 0 },
+                    0, &reasoning_effort, "",
+                ).await;
 
                 if e.is_timeout() {
                     warn!(account_id = account.db_id, "超时");
@@ -414,9 +429,74 @@ async fn proxy_request(
     )
 }
 
-/// 流式响应转发（带 TTFT 追踪 + usage 提取 + 客户端断连检测）
+/// Peek 首 chunk 的结果
+enum PeekResult {
+    /// 成功读到有效数据
+    Data(Bytes),
+    /// 上游 SSE 流中包含错误事件（response.failed 等）
+    UpstreamError(String),
+    /// 流直接结束（空流）
+    Empty,
+    /// 网络层错误
+    NetworkError(String),
+}
+
+/// 从上游流中 peek 第一个 chunk，判断是否为有效数据
+///
+/// 参照 Go 项目 openai_responses_handlers.go:197-244
+/// 在返回 SSE 响应之前验证上游是否真正开始输出数据
+async fn peek_first_chunk(
+    stream: &mut (impl Stream<Item = Result<Bytes, reqwest::Error>> + Unpin),
+) -> PeekResult {
+    // 读取第一个 chunk（可能需要多个 chunk 才能凑齐一个完整 SSE 事件）
+    let mut buf = Vec::new();
+
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(data) => {
+                buf.extend_from_slice(&data);
+                let text = String::from_utf8_lossy(&buf);
+
+                // 检查是否包含错误事件
+                for line in text.lines() {
+                    if let Some(json_str) = line.strip_prefix("data: ") {
+                        if json_str == "[DONE]" {
+                            continue;
+                        }
+                        if let Ok(event) = serde_json::from_str::<Value>(json_str) {
+                            let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                            if event_type == "response.failed" {
+                                let error_msg = event
+                                    .get("response")
+                                    .and_then(|r| r.get("status_details"))
+                                    .and_then(|d| d.get("error"))
+                                    .and_then(|e| e.get("message"))
+                                    .and_then(|m| m.as_str())
+                                    .unwrap_or("unknown upstream error");
+                                return PeekResult::UpstreamError(error_msg.to_string());
+                            }
+                        }
+                    }
+                }
+
+                // 有数据且不是错误 → 返回
+                return PeekResult::Data(Bytes::from(buf));
+            }
+            Err(e) => {
+                return PeekResult::NetworkError(e.to_string());
+            }
+        }
+    }
+
+    PeekResult::Empty
+}
+
+/// 流式响应转发（带 TTFT 追踪 + usage 提取 + 客户端断连检测 + 心跳）
+///
+/// 接收已 peek 过的 first_chunk 和剩余 stream
 async fn stream_response_with_tracking(
-    resp: reqwest::Response,
+    first_chunk: Bytes,
+    remaining_stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + Unpin + 'static,
     translate: bool,
     state: Arc<AppState>,
     account_id: i64,
@@ -426,7 +506,7 @@ async fn stream_response_with_tracking(
     reasoning_effort: &str,
     request_start: Instant,
 ) -> Response {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(256);
 
     let endpoint = endpoint.to_string();
     let model = model.to_string();
@@ -435,64 +515,115 @@ async fn stream_response_with_tracking(
 
     tokio::spawn(async move {
         let mut translator = StreamTranslator::new();
-        let mut stream = resp.bytes_stream();
         let mut first_token_time: Option<Instant> = None;
         let mut wrote_any_body = false;
         let mut client_gone = false;
 
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Ok(data) => {
-                    if translate {
-                        match translator.translate_chunk(&data) {
-                            Ok(translated) => {
-                                if translator.first_delta_received && first_token_time.is_none() {
-                                    first_token_time = Some(Instant::now());
-                                }
-                                if !translated.is_empty() {
-                                    if tx.send(Ok(Bytes::from(translated))).await.is_err() {
-                                        client_gone = true;
-                                        break;
-                                    }
-                                    wrote_any_body = true;
-                                }
-                            }
-                            Err(_) => {
-                                if tx.send(Ok(data)).await.is_err() {
-                                    client_gone = true;
-                                    break;
-                                }
-                                wrote_any_body = true;
-                            }
-                        }
-                    } else {
-                        // passthrough 模式 — 解析 SSE 事件提取 usage 和 TTFT
-                        translator.track_raw_chunk(&data);
+        // 处理已 peek 过的第一个 chunk
+        let process_chunk = |translator: &mut StreamTranslator,
+                             data: &Bytes,
+                             translate: bool,
+                             first_token_time: &mut Option<Instant>|
+         -> Result<Vec<u8>, Bytes> {
+            if translate {
+                match translator.translate_chunk(data) {
+                    Ok(translated) => {
                         if translator.first_delta_received && first_token_time.is_none() {
-                            first_token_time = Some(Instant::now());
+                            *first_token_time = Some(Instant::now());
                         }
-                        if tx.send(Ok(data)).await.is_err() {
+                        Ok(translated)
+                    }
+                    Err(_) => Err(data.clone()),
+                }
+            } else {
+                translator.track_raw_chunk(data);
+                if translator.first_delta_received && first_token_time.is_none() {
+                    *first_token_time = Some(Instant::now());
+                }
+                Err(data.clone()) // passthrough
+            }
+        };
+
+        // 发送第一个 chunk（TTFT 从此刻更准确）
+        match process_chunk(&mut translator, &first_chunk, translate, &mut first_token_time) {
+            Ok(translated) => {
+                if !translated.is_empty() {
+                    if tx.send(Ok(Bytes::from(translated))).await.is_err() {
+                        client_gone = true;
+                    }
+                    wrote_any_body = true;
+                }
+            }
+            Err(raw) => {
+                if tx.send(Ok(raw)).await.is_err() {
+                    client_gone = true;
+                }
+                wrote_any_body = true;
+            }
+        }
+
+        // 处理剩余流（带心跳）
+        if !client_gone {
+            let mut stream = remaining_stream;
+            let mut keepalive_timer = tokio::time::interval(Duration::from_secs(15));
+            keepalive_timer.tick().await; // 消耗首次立即触发
+
+            loop {
+                tokio::select! {
+                    chunk = stream.next() => {
+                        match chunk {
+                            Some(Ok(data)) => {
+                                match process_chunk(&mut translator, &data, translate, &mut first_token_time) {
+                                    Ok(translated) => {
+                                        if !translated.is_empty() {
+                                            if tx.send(Ok(Bytes::from(translated))).await.is_err() {
+                                                client_gone = true;
+                                                break;
+                                            }
+                                            wrote_any_body = true;
+                                        }
+                                    }
+                                    Err(raw) => {
+                                        if tx.send(Ok(raw)).await.is_err() {
+                                            client_gone = true;
+                                            break;
+                                        }
+                                        wrote_any_body = true;
+                                    }
+                                }
+                            }
+                            Some(Err(e)) => {
+                                translator.stream_broken = true;
+                                let err_msg = e.to_string();
+                                if wrote_any_body {
+                                    let _ = tx
+                                        .send(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
+                                        .await;
+                                }
+                                warn!("上游流异常中断: {err_msg}");
+                                break;
+                            }
+                            None => break, // 流结束
+                        }
+                    }
+                    _ = keepalive_timer.tick() => {
+                        // SSE 心跳注释行，防止 thinking 阶段客户端超时
+                        if tx.send(Ok(Bytes::from_static(b": keep-alive\n\n"))).await.is_err() {
                             client_gone = true;
                             break;
                         }
-                        wrote_any_body = true;
                     }
-                }
-                Err(e) => {
-                    if wrote_any_body {
-                        // 已向客户端写过数据，无法重试，发送错误
-                        let _ = tx
-                            .send(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
-                            .await;
-                    }
-                    // 未写过数据的上游断连 → 调用方可透明重试（当前 log 记录）
-                    break;
                 }
             }
         }
 
         // 冲刷 pending 缓冲（处理流末尾卡在缓冲里的 response.completed）
         translator.flush_pending();
+
+        // 流正常结束但未收到 completed 事件 → 标记为断流
+        if !translator.completed && !client_gone {
+            translator.stream_broken = true;
+        }
 
         // 计算指标
         let first_token_ms = first_token_time
@@ -505,21 +636,32 @@ async fn stream_response_with_tracking(
             // 客户端断连 → 499
             let u = translator.usage.clone().unwrap_or_else(|| translator.estimate_tokens_on_break());
             (u, 499)
-        } else if let Some(ref u) = translator.usage {
-            (u.clone(), 200)
+        } else if translator.completed && translator.usage.is_some() {
+            // 完整完成 → 200
+            (translator.usage.clone().unwrap(), 200)
         } else {
-            // 上游断连且未收到 completed
-            (translator.estimate_tokens_on_break(), 200)
+            // 断流（上游中断 / 未收到 completed）→ 206
+            (translator.estimate_tokens_on_break(), 206)
         };
 
         let service_tier = translator.service_tier.clone();
 
-        send_usage_log(
-            &state, account_id, &endpoint, &model,
-            log_status as i64, duration, true, &email,
-            &usage, first_token_ms, &effort, &service_tier,
-        )
-        .await;
+        // 参照 Go 的 usage_helpers.go:72-74：全 0 token 且非失败 → 跳过无意义记录
+        let is_empty_usage = usage.input_tokens == 0
+            && usage.output_tokens == 0
+            && usage.reasoning_tokens == 0
+            && usage.cached_tokens == 0;
+
+        if is_empty_usage && log_status == 206 {
+            warn!("断流且无 token 数据，跳过 usage 记录");
+        } else {
+            send_usage_log(
+                &state, account_id, &endpoint, &model,
+                log_status as i64, duration, true, &email,
+                &usage, first_token_ms, &effort, &service_tier,
+            )
+            .await;
+        }
     });
 
     let stream = ReceiverStream::new(rx);

@@ -8,7 +8,7 @@ pub struct RateLimiter {
     /// 当前桶中可用令牌数 ×1000
     tokens_1000: AtomicI64,
     /// 上次补充时间
-    last_refill: std::sync::Mutex<Instant>,
+    last_refill: parking_lot::Mutex<Instant>,
 }
 
 impl RateLimiter {
@@ -16,7 +16,7 @@ impl RateLimiter {
         Self {
             rpm: AtomicI64::new(rpm),
             tokens_1000: AtomicI64::new(rpm * 1000),
-            last_refill: std::sync::Mutex::new(Instant::now()),
+            last_refill: parking_lot::Mutex::new(Instant::now()),
         }
     }
 
@@ -51,7 +51,7 @@ impl RateLimiter {
             return;
         }
 
-        let mut last = self.last_refill.lock().unwrap();
+        let mut last = self.last_refill.lock();
         let now = Instant::now();
         let elapsed = now.duration_since(*last);
         let elapsed_ms = elapsed.as_millis() as i64;

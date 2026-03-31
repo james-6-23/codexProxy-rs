@@ -80,6 +80,34 @@ pub fn version_from_ua(ua: &str) -> &str {
     super::CLIENT_VERSION
 }
 
+/// 从 UA 中提取平台 OS 和 Arch（与 X-Stainless-Os / X-Stainless-Arch 保持一致）
+///
+/// UA 格式: `codex_cli_rs/0.117.0 (Mac OS 15.5.0; arm64) ...`
+/// 返回 `("MacOS", "arm64")` / `("Linux", "x86_64")` / `("Windows", "x86_64")`
+pub fn platform_from_ua(ua: &str) -> (&str, &str) {
+    // 提取括号内的平台描述
+    let inner = ua
+        .find('(')
+        .and_then(|s| ua[s + 1..].find(')').map(|e| &ua[s + 1..s + 1 + e]))
+        .unwrap_or("");
+
+    let os = if inner.contains("Mac OS") {
+        "MacOS"
+    } else if inner.contains("Windows") {
+        "Windows"
+    } else {
+        "Linux"
+    };
+
+    let arch = if inner.contains("arm64") {
+        "arm64"
+    } else {
+        "x86_64"
+    };
+
+    (os, arch)
+}
+
 /// FNV-32a 哈希（与 Go 版 hash/fnv.New32a 一致）
 fn fnv32a(data: &[u8]) -> u32 {
     let mut hash: u32 = 0x811c9dc5;

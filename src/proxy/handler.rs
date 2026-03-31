@@ -299,7 +299,7 @@ async fn proxy_request(
                 let status_u16 = status.as_u16();
 
                 // 输出上游错误日志（401 → ERROR 红色，其余 → WARN 黄色）
-                let err_body_short: String = error_body.chars().take(200).collect();
+                let err_body_short: String = error_body.chars().take(500).collect();
                 if status_u16 == 401 {
                     error!(
                         endpoint,

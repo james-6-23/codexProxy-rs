@@ -36,15 +36,17 @@ pub struct Credentials {
     pub account_id: String,
     #[serde(default)]
     pub plan_type: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
     pub codex_7d_used_percent: f64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
     pub codex_5h_used_percent: f64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub codex_7d_reset_at: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub codex_5h_reset_at: String,
 }
+
+fn is_zero_f64(v: &f64) -> bool { *v == 0.0 }
 
 // ─── 使用日志 ───
 

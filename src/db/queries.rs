@@ -104,7 +104,8 @@ pub async fn batch_delete_accounts(pool: &DbPool, ids: &[i64]) -> Result<i64> {
 
 pub async fn update_account_credentials(pool: &DbPool, id: i64, creds: &Credentials) -> Result<()> {
     let creds_json = serde_json::to_value(creds)?;
-    sqlx::query("UPDATE accounts SET credentials = $1, updated_at = NOW() WHERE id = $2")
+    // 使用 || 合并而非替换，保留已有的 usage/reset 字段
+    sqlx::query("UPDATE accounts SET credentials = credentials || $1, updated_at = NOW() WHERE id = $2")
         .bind(creds_json)
         .bind(id)
         .execute(pool)

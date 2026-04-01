@@ -562,6 +562,19 @@ pub async fn update_account_resets_at(pool: &DbPool, id: i64, resets_at: i64) ->
     Ok(())
 }
 
+/// 持久化账号用量百分比到 credentials JSONB
+pub async fn persist_account_usage(pool: &DbPool, id: i64, usage_7d: f64, usage_5h: f64) -> Result<()> {
+    sqlx::query(
+        "UPDATE accounts SET credentials = credentials || jsonb_build_object('codex_7d_used_percent', $1::FLOAT8, 'codex_5h_used_percent', $2::FLOAT8), updated_at = NOW() WHERE id = $3",
+    )
+    .bind(usage_7d)
+    .bind(usage_5h)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// 清除账号用量状态（探针恢复后调用）
 pub async fn clear_account_usage_state(pool: &DbPool, id: i64) -> Result<()> {
     sqlx::query(

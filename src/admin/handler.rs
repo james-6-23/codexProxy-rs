@@ -1062,6 +1062,15 @@ async fn batch_test_one(
             let was_cooldown = acc.is_in_cooldown();
             let resets_at = acc.resets_at.load(Ordering::Relaxed);
 
+            // 持久化用量到数据库
+            let db = state.db();
+            let aid = acc.db_id;
+            let u7d = usage_7d as f64 / 100.0;
+            let u5h = usage_5h as f64 / 100.0;
+            tokio::spawn(async move {
+                let _ = queries::persist_account_usage(&db, aid, u7d, u5h).await;
+            });
+
             if (was_cooldown || resets_at > 0) && usage_7d < 10000 && usage_5h < 10000 {
                 acc.resets_at.store(0, Ordering::Relaxed);
                 acc.usage_7d_pct_100.store(0, Ordering::Relaxed);
@@ -1083,7 +1092,7 @@ async fn batch_test_one(
 
             info!(
                 account_id = acc.db_id, email = %email, latency,
-                usage_7d = usage_7d as f64 / 100.0,
+                usage_7d = u7d,
                 "批量测试 200"
             );
             BatchTestResult::Success

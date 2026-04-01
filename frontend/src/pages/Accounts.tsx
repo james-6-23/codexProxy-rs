@@ -1759,12 +1759,14 @@ function UsageCell({ account }: { account: AccountRow }) {
   const plan = (account.plan_type || '').toLowerCase()
   const has7d = account.usage_percent_7d !== null && account.usage_percent_7d !== undefined
   const has5h = account.usage_percent_5h !== null && account.usage_percent_5h !== undefined
+  // 只有限流状态才显示重置时间
+  const isLimited = account.status === 'rate_limited'
 
   if (plan === 'free') {
     if (!has7d) return <span className="text-[12px] text-muted-foreground">-</span>
     return (
       <div className="w-40">
-        <UsageBar label="7d" pct={account.usage_percent_7d!} resetAt={account.reset_7d_at} />
+        <UsageBar label="7d" pct={account.usage_percent_7d!} resetAt={isLimited ? account.reset_7d_at : undefined} />
       </div>
     )
   }
@@ -1773,8 +1775,8 @@ function UsageCell({ account }: { account: AccountRow }) {
     if (!has5h && !has7d) return <span className="text-[12px] text-muted-foreground">-</span>
     return (
       <div className="w-48 space-y-1.5">
-        {has5h && <UsageBar label="5h" pct={account.usage_percent_5h!} resetAt={account.reset_5h_at} />}
-        {has7d && <UsageBar label="7d" pct={account.usage_percent_7d!} resetAt={account.reset_7d_at} />}
+        {has5h && <UsageBar label="5h" pct={account.usage_percent_5h!} resetAt={isLimited ? account.reset_5h_at : undefined} />}
+        {has7d && <UsageBar label="7d" pct={account.usage_percent_7d!} resetAt={isLimited ? account.reset_7d_at : undefined} />}
       </div>
     )
   }
@@ -1782,7 +1784,7 @@ function UsageCell({ account }: { account: AccountRow }) {
   if (has7d) {
     return (
       <div className="w-40">
-        <UsageBar label="7d" pct={account.usage_percent_7d!} resetAt={account.reset_7d_at} />
+        <UsageBar label="7d" pct={account.usage_percent_7d!} resetAt={isLimited ? account.reset_7d_at : undefined} />
       </div>
     )
   }

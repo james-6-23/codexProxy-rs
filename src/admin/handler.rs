@@ -1072,13 +1072,27 @@ async fn batch_test_one(
 
             // 用量 ≥ 100% — 标记为限流，即使 200 也不该继续调度
             if usage_7d >= 10000 || usage_5h >= 10000 {
-                // 从 header 的 reset-after-seconds 计算冷却时间，fallback 7 天
                 let resets_at_cur = acc.resets_at.load(Ordering::Relaxed);
                 if resets_at_cur > 0 {
                     let cooldown = (resets_at_cur - chrono::Utc::now().timestamp()).max(60);
                     state.scheduler.mark_cooldown(acc, "rate_limited", cooldown);
+                    // 持久化 resets_at（可能来自 header 的 reset-after-seconds）
+                    let db = state.db();
+                    let aid = acc.db_id;
+                    let ts = resets_at_cur;
+                    tokio::spawn(async move {
+                        let _ = queries::update_account_resets_at(&db, aid, ts).await;
+                    });
                 } else {
+                    // 无 resets_at → 设 7 天冷却并持久化
+                    let fallback_ts = chrono::Utc::now().timestamp() + 7 * 24 * 3600;
+                    acc.resets_at.store(fallback_ts, Ordering::Relaxed);
                     state.scheduler.mark_cooldown(acc, "rate_limited", 7 * 24 * 3600);
+                    let db = state.db();
+                    let aid = acc.db_id;
+                    tokio::spawn(async move {
+                        let _ = queries::update_account_resets_at(&db, aid, fallback_ts).await;
+                    });
                 }
 
                 warn!(

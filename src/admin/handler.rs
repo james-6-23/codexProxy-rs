@@ -1009,7 +1009,7 @@ async fn batch_test_one(
     let payload = json!({
         "model": model,
         "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
-        "stream": false,
+        "stream": true,
         "store": false,
         "instructions": "",
     });
@@ -1129,7 +1129,9 @@ async fn batch_test_one(
             acc.report_failure(scheduler::FailureType::Other);
             state.scheduler.recompute_health(acc);
 
-            warn!(account_id = acc.db_id, email = %email, status, "批量测试失败");
+            let body = resp.text().await.unwrap_or_default();
+            let body_short: String = body.chars().take(200).collect();
+            warn!(account_id = acc.db_id, email = %email, status, body = %body_short, "批量测试失败");
             BatchTestResult::Failed
         }
     }

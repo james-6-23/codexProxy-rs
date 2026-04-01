@@ -679,11 +679,11 @@ async fn probe_and_recover(state: &AppState, acc: &Arc<Account>, model: &str) {
     let codex_account_id = acc.codex_account_id.read().clone();
     let account_id_str = acc.db_id.to_string();
 
-    // 最小探针：stream=false、store=false、最短 prompt
+    // 最小探针：stream=true（Codex 不支持 false）、store=false、最短 prompt
     let payload = serde_json::json!({
         "model": model,
         "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
-        "stream": false,
+        "stream": true,
         "store": false,
         "instructions": "",
     });

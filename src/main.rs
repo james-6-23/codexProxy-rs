@@ -105,6 +105,21 @@ async fn main() {
             }
         }
 
+        // 恢复冷却状态：用量 ≥ 100% 或 resets_at 未到期 → 标记冷却
+        let usage_7d = account.usage_7d_pct_100.load(std::sync::atomic::Ordering::Relaxed);
+        let usage_5h = account.usage_5h_pct_100.load(std::sync::atomic::Ordering::Relaxed);
+        let resets_at = account.resets_at.load(std::sync::atomic::Ordering::Relaxed);
+        let now = chrono::Utc::now().timestamp();
+
+        if usage_7d >= 10000 || usage_5h >= 10000 {
+            // 用量满 → 冷却到 resets_at，无 resets_at 则 7 天
+            let cooldown_until = if resets_at > now { resets_at } else { now + 7 * 24 * 3600 };
+            account.cooldown_until.store(cooldown_until, std::sync::atomic::Ordering::Relaxed);
+        } else if resets_at > now {
+            // 有未到期的重置时间 → 冷却到 resets_at
+            account.cooldown_until.store(resets_at, std::sync::atomic::Ordering::Relaxed);
+        }
+
         scheduler.add_account(account);
     }
     info!(count = loaded_count, "已加载账号到调度器");

@@ -255,6 +255,7 @@ export interface ChartTimelinePoint {
   reasoning_tokens: number
   cached_tokens: number
   errors_401: number
+  success_200: number
 }
 
 export interface ChartModelPoint {

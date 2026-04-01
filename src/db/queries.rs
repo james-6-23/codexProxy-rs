@@ -195,7 +195,8 @@ pub async fn query_chart_data(pool: &DbPool, range_minutes: i64, bucket_minutes:
             COALESCE(SUM(output_tokens), 0)::BIGINT AS output_tokens,
             COALESCE(SUM(reasoning_tokens), 0)::BIGINT AS reasoning_tokens,
             COALESCE(SUM(cached_tokens), 0)::BIGINT AS cached_tokens,
-            COALESCE(SUM(CASE WHEN status_code = 401 THEN 1 ELSE 0 END), 0)::BIGINT AS errors_401
+            COALESCE(SUM(CASE WHEN status_code = 401 THEN 1 ELSE 0 END), 0)::BIGINT AS errors_401,
+            COALESCE(SUM(CASE WHEN status_code >= 200 AND status_code < 300 THEN 1 ELSE 0 END), 0)::BIGINT AS success_200
          FROM usage_logs
          WHERE created_at >= NOW() - $2::INTERVAL AND status_code != 499
          GROUP BY bucket ORDER BY bucket",

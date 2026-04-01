@@ -140,6 +140,7 @@ pub struct ChartBucket {
     pub reasoning_tokens: i64,
     pub cached_tokens: i64,
     pub errors_401: i64,
+    pub success_200: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

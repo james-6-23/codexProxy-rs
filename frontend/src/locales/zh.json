@@ -106,6 +106,7 @@
     "modelRankingDesc": "按请求量展示选定范围内最常用的模型。",
     "seriesRequests": "请求数",
     "series401Errors": "401 错误",
+    "seriesSuccess": "成功 (200)",
     "seriesAvgLatency": "平均耗时",
     "seriesInputTokens": "输入 Token",
     "seriesOutputTokens": "输出 Token",

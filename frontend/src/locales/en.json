@@ -106,6 +106,7 @@
     "modelRankingDesc": "Top models by request volume in the selected range.",
     "seriesRequests": "Requests",
     "series401Errors": "401 Errors",
+    "seriesSuccess": "Success (200)",
     "seriesAvgLatency": "Avg Latency",
     "seriesInputTokens": "Input Tokens",
     "seriesOutputTokens": "Output Tokens",

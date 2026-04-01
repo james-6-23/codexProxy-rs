@@ -40,6 +40,7 @@ interface TimelinePoint {
   reasoningTokens: number
   cachedTokens: number
   errors401: number
+  success200: number
 }
 
 interface ModelRankingPoint {
@@ -119,6 +120,7 @@ export default function DashboardUsageCharts({
         reasoningTokens: point.reasoning_tokens,
         cachedTokens: point.cached_tokens,
         errors401: point.errors_401,
+        success200: point.success_200,
       }
     })
 
@@ -250,6 +252,15 @@ export default function DashboardUsageCharts({
                   dataKey="errors401"
                   name={t('dashboard.series401Errors')}
                   stroke="var(--color-destructive)"
+                  strokeWidth={2}
+                  dot={false}
+                  activeDot={{ r: 4 }}
+                />
+                <Line
+                  type="monotone"
+                  dataKey="success200"
+                  name={t('dashboard.seriesSuccess')}
+                  stroke="hsl(var(--success))"
                   strokeWidth={2}
                   dot={false}
                   activeDot={{ r: 4 }}

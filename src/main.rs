@@ -14,7 +14,7 @@ use axum::response::IntoResponse;
 use axum::routing::{delete, get, post, put};
 use axum::Router;
 use tower_http::cors::CorsLayer;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::config::AppConfig;
 use crate::db::models::UsageLog;
@@ -98,9 +98,25 @@ async fn main() {
             std::sync::atomic::Ordering::Relaxed,
         );
 
+        // 恢复用量重置时间
+        if !creds.codex_7d_reset_at.is_empty() {
+            if let Ok(ts) = creds.codex_7d_reset_at.parse::<i64>() {
+                account.resets_at.store(ts, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
         scheduler.add_account(account);
     }
     info!(count = loaded_count, "已加载账号到调度器");
+
+    // 从数据库恢复请求计数（跨重启保持一致）
+    if let Ok(counts) = db::queries::get_account_request_counts(&db_pool).await {
+        for acc in scheduler.all_accounts() {
+            if let Some(&(total, _errors)) = counts.get(&acc.db_id) {
+                acc.total_requests.store(total, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
 
     // 限流器
     let rate_limiter = RateLimiter::new(settings.global_rpm as i64);
@@ -161,6 +177,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/admin/accounts/{id}", delete(admin::handler::delete_account))
         .route("/api/admin/accounts/batch-delete", post(admin::handler::batch_delete_accounts))
         .route("/api/admin/accounts/{id}/refresh", post(admin::handler::refresh_account))
+        .route("/api/admin/accounts/batch-refresh", post(admin::handler::batch_refresh))
         .route("/api/admin/accounts/{id}/test", get(admin::handler::test_connection))
         .route("/api/admin/accounts/{id}/usage", get(admin::handler::account_usage))
         .route("/api/admin/accounts/batch-test", post(admin::handler::batch_test))
@@ -381,6 +398,16 @@ fn spawn_background_tasks(
         loop {
             interval.tick().await;
             auto_cleanup_expired(&state8).await;
+        }
+    });
+
+    // 9. 用量重置倒计时检查（每 30 秒）
+    let state9 = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            check_usage_reset(&state9).await;
         }
     });
 }
@@ -604,5 +631,165 @@ async fn auto_cleanup_expired(state: &AppState) {
 
     if cleaned > 0 {
         info!(cleaned, "过期账号清理完成");
+    }
+}
+
+/// 用量重置检查 — 倒计时到期后发单次探针确认
+///
+/// 安全策略：
+/// 1. 每 30s 检查 resets_at 倒计时，未到期的绝不发请求
+/// 2. 到期后仅发一次最小探针（使用 test_model）
+/// 3. 200 → 恢复账号；429 → 记录新 resets_at 继续等待
+/// 4. 探针失败不改变账号状态，等下个周期重试
+async fn check_usage_reset(state: &AppState) {
+    let accounts = state.scheduler.all_accounts();
+    let now = chrono::Utc::now().timestamp();
+
+    // 收集到期账号（避免在遍历中持有锁太久）
+    let due: Vec<_> = accounts
+        .iter()
+        .filter(|acc| {
+            let ts = acc.resets_at.load(std::sync::atomic::Ordering::Relaxed);
+            ts > 0 && ts <= now
+        })
+        .collect();
+
+    if due.is_empty() {
+        return;
+    }
+
+    let test_model = state.db_settings_cache.read()
+        .map(|s| s.test_model.clone())
+        .unwrap_or_else(|_| "gpt-5.4-mini".to_string());
+
+    for acc in due {
+        probe_and_recover(state, acc, &test_model).await;
+    }
+}
+
+/// 对单个到期账号发探针确认，根据结果决定恢复或继续等待
+async fn probe_and_recover(state: &AppState, acc: &Arc<Account>, model: &str) {
+    let access_token = acc.access_token.read().clone();
+    if access_token.is_empty() {
+        return;
+    }
+
+    let proxy_url = acc.proxy_url.read().clone();
+    let codex_account_id = acc.codex_account_id.read().clone();
+    let account_id_str = acc.db_id.to_string();
+
+    // 最小探针：stream=false、store=false、最短 prompt
+    let payload = serde_json::json!({
+        "model": model,
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        "stream": false,
+        "store": false,
+        "instructions": "",
+    });
+
+    let upstream_url = format!("{}/responses", proxy::UPSTREAM_BASE);
+    let ua = proxy::useragent::ua_for_account(&account_id_str);
+    let version = proxy::useragent::version_from_ua(ua);
+    let client = proxy::handler::get_or_create_client(state, &proxy_url);
+
+    let mut req = client
+        .post(&upstream_url)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header("User-Agent", ua)
+        .header("Version", version)
+        .header("Originator", proxy::ORIGINATOR)
+        .json(&payload)
+        .timeout(Duration::from_secs(30));
+
+    if !codex_account_id.is_empty() {
+        req = req.header("Chatgpt-Account-Id", &codex_account_id);
+    }
+
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            // 网络失败 → 不动状态，下个周期重试
+            warn!(account_id = acc.db_id, error = %e, "重置探针请求失败，稍后重试");
+            return;
+        }
+    };
+
+    let status = resp.status().as_u16();
+    let resp_headers = resp.headers().clone();
+
+    // 无论结果如何都刷新用量 header
+    proxy::handler::update_usage_from_headers(acc, &resp_headers);
+
+    match status {
+        200 => {
+            // 200 不代表用量一定恢复 — 检查响应头中的实际用量
+            let usage_7d = acc.usage_7d_pct_100.load(std::sync::atomic::Ordering::Relaxed);
+            let usage_5h = acc.usage_5h_pct_100.load(std::sync::atomic::Ordering::Relaxed);
+
+            if usage_7d >= 10000 || usage_5h >= 10000 {
+                // 用量仍 ≥ 100% — 不恢复，30 分钟后再探测
+                let retry_at = chrono::Utc::now().timestamp() + 1800;
+                acc.resets_at.store(retry_at, std::sync::atomic::Ordering::Relaxed);
+                warn!(
+                    account_id = acc.db_id,
+                    usage_7d = usage_7d as f64 / 100.0,
+                    usage_5h = usage_5h as f64 / 100.0,
+                    "重置探针 200 但用量仍满 — 30 分钟后重试"
+                );
+                return;
+            }
+
+            // 用量 < 100% — 确认恢复
+            acc.resets_at.store(0, std::sync::atomic::Ordering::Relaxed);
+            acc.usage_7d_pct_100.store(0, std::sync::atomic::Ordering::Relaxed);
+            acc.usage_5h_pct_100.store(0, std::sync::atomic::Ordering::Relaxed);
+            state.scheduler.try_recover(acc);
+
+            let db = state.db();
+            let aid = acc.db_id;
+            tokio::spawn(async move {
+                let _ = db::queries::clear_account_usage_state(&db, aid).await;
+            });
+
+            let email = acc.email.read().clone();
+            info!(account_id = acc.db_id, email = %email, "重置探针 200 — 账号已恢复调度");
+        }
+        429 => {
+            // 仍然限流 — 从新响应更新 resets_at
+            let body = resp.text().await.unwrap_or_default();
+            if let Ok(body_json) = serde_json::from_str::<serde_json::Value>(&body) {
+                if let Some(ts) = body_json.pointer("/error/resets_at").and_then(|v| v.as_i64()) {
+                    acc.resets_at.store(ts, std::sync::atomic::Ordering::Relaxed);
+                    let db = state.db();
+                    let aid = acc.db_id;
+                    tokio::spawn(async move {
+                        let _ = db::queries::update_account_resets_at(&db, aid, ts).await;
+                    });
+                    warn!(account_id = acc.db_id, resets_at = ts, "重置探针 429 — 已更新下次重置时间");
+                    return;
+                }
+            }
+            // 429 但没有新的 resets_at → 30 分钟后再试
+            let retry_at = chrono::Utc::now().timestamp() + 1800;
+            acc.resets_at.store(retry_at, std::sync::atomic::Ordering::Relaxed);
+            warn!(account_id = acc.db_id, "重置探针 429 无 resets_at — 30 分钟后重试");
+        }
+        401 => {
+            // Token 失效 — 标记 banned，清除探针
+            acc.resets_at.store(0, std::sync::atomic::Ordering::Relaxed);
+            state.scheduler.mark_banned(acc);
+            let db = state.db();
+            let aid = acc.db_id;
+            tokio::spawn(async move {
+                let _ = db::queries::update_account_resets_at(&db, aid, 0).await;
+            });
+            warn!(account_id = acc.db_id, "重置探针 401 — 标记 banned");
+        }
+        _ => {
+            // 其他错误 → 不动状态，下个周期重试
+            warn!(account_id = acc.db_id, status, "重置探针异常状态码，稍后重试");
+        }
     }
 }

@@ -48,6 +48,7 @@ export default function Accounts() {
   const [refreshingIds, setRefreshingIds] = useState<Set<number>>(new Set())
   const [batchLoading, setBatchLoading] = useState(false)
   const [batchTesting, setBatchTesting] = useState(false)
+  const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [cleaningBanned, setCleaningBanned] = useState(false)
   const [cleaningRateLimited, setCleaningRateLimited] = useState(false)
   const [cleaningError, setCleaningError] = useState(false)
@@ -547,6 +548,23 @@ export default function Accounts() {
     }
   }
 
+  const handleBatchRefreshAll = async () => {
+    setBatchRefreshing(true)
+    try {
+      const result = await api.batchRefreshAccounts()
+      showToast(t('accounts.batchRefreshAllDone', {
+        success: result.success,
+        fail: result.fail,
+        skipped: result.skipped,
+      }))
+      void reload()
+    } catch (error) {
+      showToast(t('accounts.batchRefreshAllFailed', { error: getErrorMessage(error) }), 'error')
+    } finally {
+      setBatchRefreshing(false)
+    }
+  }
+
   const handleCleanBanned = async () => {
     const confirmed = await confirm({
       title: t('accounts.cleanBannedTitle'),
@@ -627,6 +645,10 @@ export default function Accounts() {
               <Button variant="outline" size="sm" disabled={batchTesting} onClick={() => void handleBatchTest()}>
                 <FlaskConical className="size-3" />
                 {batchTesting ? t('accounts.batchTesting') : t('accounts.batchTest')}
+              </Button>
+              <Button variant="outline" size="sm" disabled={batchRefreshing} onClick={() => void handleBatchRefreshAll()}>
+                <RefreshCw className={`size-3 ${batchRefreshing ? 'animate-spin' : ''}`} />
+                {batchRefreshing ? t('accounts.batchRefreshing') : t('accounts.batchRefreshAll')}
               </Button>
               <Button variant="outline" size="sm" disabled={cleaningBanned} onClick={() => void handleCleanBanned()}>
                 <Ban className="size-3" />
@@ -1688,6 +1710,21 @@ function formatResetAt(resetAt: string | undefined): string | null {
   return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
+// 计算倒计时文本（精确到分钟）
+function formatCountdown(resetAt: string | undefined): string | null {
+  if (!resetAt) return null
+  const d = new Date(resetAt)
+  const diff = d.getTime() - Date.now()
+  if (diff <= 0) return null
+  const totalMin = Math.floor(diff / 60000)
+  const days = Math.floor(totalMin / 1440)
+  const hours = Math.floor((totalMin % 1440) / 60)
+  const mins = totalMin % 60
+  if (days > 0) return `${days}天${hours}时${mins}分`
+  if (hours > 0) return `${hours}时${mins}分`
+  return `${mins}分`
+}
+
 // 用量进度条颜色
 function usageBarColor(pct: number): string {
   if (pct >= 90) return 'bg-red-500'
@@ -1698,6 +1735,7 @@ function usageBarColor(pct: number): string {
 // 单行用量进度条
 function UsageBar({ label, pct, resetAt }: { label: string; pct: number; resetAt?: string }) {
   const resetText = formatResetAt(resetAt)
+  const countdown = formatCountdown(resetAt)
   return (
     <div>
       <div className="flex items-center gap-1.5">
@@ -1707,7 +1745,11 @@ function UsageBar({ label, pct, resetAt }: { label: string; pct: number; resetAt
         </div>
         <span className="text-[12px] font-semibold w-[42px] text-right shrink-0">{pct.toFixed(1)}%</span>
       </div>
-      {resetText && <div className="text-[11px] font-medium text-muted-foreground mt-0.5 pl-[26px]">⏱ {resetText}</div>}
+      {resetText && (
+        <div className="text-[11px] font-medium text-muted-foreground mt-0.5 pl-[26px]">
+          ⏱ {resetText}{countdown && <span className="ml-1 text-amber-600 dark:text-amber-400">({countdown})</span>}
+        </div>
+      )}
     </div>
   )
 }

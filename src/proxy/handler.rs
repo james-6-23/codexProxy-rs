@@ -364,6 +364,21 @@ async fn proxy_request(
                     }
                     429 => {
                         account.report_failure(FailureType::RateLimited);
+                        // 首次 429 时记录 resets_at（上游用量重置时间）
+                        if account.resets_at.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                            if let Ok(body_json) = serde_json::from_str::<Value>(&error_body) {
+                                if let Some(ts) = body_json.pointer("/error/resets_at").and_then(|v| v.as_i64()) {
+                                    account.resets_at.store(ts, std::sync::atomic::Ordering::Relaxed);
+                                    // 异步持久化到数据库
+                                    let db = state.db();
+                                    let aid = account.db_id;
+                                    tokio::spawn(async move {
+                                        let _ = crate::db::queries::update_account_resets_at(&db, aid, ts).await;
+                                    });
+                                    info!(account_id = account.db_id, resets_at = ts, "记录用量重置时间");
+                                }
+                            }
+                        }
                         let auto_clean = state.db_settings_cache.read()
                             .map(|s| s.auto_clean_rate_limited)
                             .unwrap_or(false);
@@ -781,7 +796,7 @@ async fn collect_sync_response(
 // ─── 辅助函数 ───
 
 /// 获取或创建 HTTP Client（按 proxy_url 池化复用，避免重复 TLS 握手）
-fn get_or_create_client(state: &AppState, account_proxy: &str) -> reqwest::Client {
+pub(crate) fn get_or_create_client(state: &AppState, account_proxy: &str) -> reqwest::Client {
     let proxy_key = if !account_proxy.is_empty() {
         account_proxy.to_string()
     } else {
@@ -813,7 +828,7 @@ fn get_or_create_client(state: &AppState, account_proxy: &str) -> reqwest::Clien
 }
 
 /// 解析 429 冷却时间 — 按 plan 和响应 header/body 智能判断
-fn parse_rate_limit_cooldown(
+pub(crate) fn parse_rate_limit_cooldown(
     headers: &HeaderMap,
     error_body: &str,
     account: &crate::scheduler::Account,
@@ -845,21 +860,40 @@ fn parse_rate_limit_cooldown(
 
     // 检查 dual-window headers
     let primary = headers
-        .get("x-codex-primary-window-percent")
+        .get("x-codex-primary-used-percent")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.0);
+    let primary_window_min = headers
+        .get("x-codex-primary-window-minutes")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(300.0); // 默认 5h
     let secondary = headers
-        .get("x-codex-secondary-window-percent")
+        .get("x-codex-secondary-used-percent")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.0);
+    let secondary_window_min = headers
+        .get("x-codex-secondary-window-minutes")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(10080.0); // 默认 7d
 
+    let window_to_cooldown = |min: f64| -> i64 {
+        if min >= 1440.0 { 7 * 24 * 3600 }
+        else if min >= 60.0 { 5 * 3600 }
+        else { 1800 }
+    };
+
+    if primary >= 100.0 && secondary >= 100.0 {
+        return window_to_cooldown(primary_window_min.max(secondary_window_min));
+    }
     if primary >= 100.0 {
-        return 5 * 3600; // 5h window 用尽
+        return window_to_cooldown(primary_window_min);
     }
     if secondary >= 100.0 {
-        return 7 * 24 * 3600; // 7d window 用尽
+        return window_to_cooldown(secondary_window_min);
     }
 
     // fallback: 按 plan_type
@@ -897,11 +931,11 @@ fn resolve_session_id(body: &Value, downstream_headers: &HeaderMap, account_id: 
 /// 从上游响应 header 提取用量百分比并更新到 Account
 ///
 /// 上游每次响应都会返回：
-/// - `x-codex-primary-window-percent` → 5h 窗口用量百分比
-/// - `x-codex-secondary-window-percent` → 7d 窗口用量百分比
-fn update_usage_from_headers(account: &crate::scheduler::Account, headers: &HeaderMap) {
+/// - `x-codex-primary-used-percent` → 5h 窗口用量百分比
+/// - `x-codex-secondary-used-percent` → 7d 窗口用量百分比
+pub(crate) fn update_usage_from_headers(account: &crate::scheduler::Account, headers: &HeaderMap) {
     if let Some(primary) = headers
-        .get("x-codex-primary-window-percent")
+        .get("x-codex-primary-used-percent")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<f64>().ok())
     {
@@ -911,7 +945,7 @@ fn update_usage_from_headers(account: &crate::scheduler::Account, headers: &Head
             .store((primary * 100.0) as i64, std::sync::atomic::Ordering::Relaxed);
     }
     if let Some(secondary) = headers
-        .get("x-codex-secondary-window-percent")
+        .get("x-codex-secondary-used-percent")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<f64>().ok())
     {

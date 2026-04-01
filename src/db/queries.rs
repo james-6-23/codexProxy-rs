@@ -4,6 +4,28 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
+/// 批量查询各账号的历史请求统计（启动时恢复内存计数器）
+pub async fn get_account_request_counts(pool: &DbPool) -> Result<std::collections::HashMap<i64, (u64, u64)>> {
+    let rows = sqlx::query(
+        "SELECT account_id,
+                COUNT(*)::BIGINT AS total,
+                COALESCE(SUM(CASE WHEN status_code >= 400 AND status_code != 499 THEN 1 ELSE 0 END), 0)::BIGINT AS errors
+         FROM usage_logs WHERE status_code != 499
+         GROUP BY account_id",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut map = std::collections::HashMap::new();
+    for row in rows {
+        let id: i64 = row.get("account_id");
+        let total: i64 = row.get("total");
+        let errors: i64 = row.get("errors");
+        map.insert(id, (total as u64, errors as u64));
+    }
+    Ok(map)
+}
+
 // ─── 账号操作 ───
 
 pub async fn list_active_accounts(pool: &DbPool) -> Result<Vec<AccountRow>> {
@@ -521,6 +543,34 @@ pub async fn clear_usage_logs(pool: &DbPool) -> Result<()> {
 }
 
 // ─── 账号事件 ───
+
+/// 更新账号的用量重置时间（仅更新 credentials JSONB 中的 codex_7d_reset_at 字段）
+pub async fn update_account_resets_at(pool: &DbPool, id: i64, resets_at: i64) -> Result<()> {
+    let ts_str = if resets_at > 0 {
+        resets_at.to_string()
+    } else {
+        String::new()
+    };
+    sqlx::query(
+        "UPDATE accounts SET credentials = credentials || jsonb_build_object('codex_7d_reset_at', $1::TEXT), updated_at = NOW() WHERE id = $2",
+    )
+    .bind(&ts_str)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// 清除账号用量状态（探针恢复后调用）
+pub async fn clear_account_usage_state(pool: &DbPool, id: i64) -> Result<()> {
+    sqlx::query(
+        "UPDATE accounts SET credentials = credentials || '{\"codex_7d_used_percent\": 0, \"codex_5h_used_percent\": 0, \"codex_7d_reset_at\": \"\", \"codex_5h_reset_at\": \"\"}'::JSONB, updated_at = NOW() WHERE id = $1",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
 
 /// 插入账号事件（added / deleted）
 pub async fn insert_account_event(pool: &DbPool, account_id: i64, event_type: &str, source: &str) {

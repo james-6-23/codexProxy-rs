@@ -14,6 +14,7 @@ use crate::db::queries;
 use crate::scheduler::{self, Account, tier_name};
 use crate::state::AppState;
 use crate::token;
+use tracing::{info, warn};
 
 // ─── 认证中间件 ───
 
@@ -137,6 +138,8 @@ pub async fn list_accounts(
         let success_requests = (total as f64 * success_rate) as u64;
         let error_requests = total - success_requests;
 
+        let resets_at = acc.resets_at.load(Ordering::Relaxed);
+
         result.push(json!({
             "id": acc.db_id,
             "name": email,
@@ -158,6 +161,8 @@ pub async fn list_accounts(
             "last_used_at": ts_to_rfc3339(last_success),
             "last_unauthorized_at": ts_to_rfc3339(last_401),
             "last_rate_limited_at": ts_to_rfc3339(last_429),
+            "resets_at": ts_to_rfc3339(resets_at),
+            "reset_7d_at": ts_to_rfc3339(resets_at),
             "created_at": acc.db_created_at.read().clone(),
             "updated_at": acc.db_updated_at.read().clone(),
         }));
@@ -461,6 +466,7 @@ pub async fn batch_import(
                             *account.refresh_token.write() = creds.refresh_token;
                             *account.expires_at.write() = expires_at;
                             state.scheduler.add_account(account);
+                            queries::insert_account_event(&state.db(), id, "added", "batch_import").await;
                             json!({"email": info.email, "status": "ok", "id": id})
                         }
                         Err(e) => {
@@ -593,6 +599,107 @@ pub async fn refresh_account(
         )
             .into_response(),
     }
+}
+
+/// POST /api/admin/accounts/batch-refresh — 一键刷新所有有 RT 的账号
+pub async fn batch_refresh(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(code) = verify_admin(&state, &headers) {
+        return (code, Json(json!({"error": "unauthorized"}))).into_response();
+    }
+
+    let accounts = state.scheduler.all_accounts();
+    let total = accounts.len();
+
+    // 筛选有 RT 的账号
+    let rt_accounts: Vec<_> = accounts
+        .iter()
+        .filter(|acc| !acc.refresh_token.read().is_empty())
+        .collect();
+    let rt_count = rt_accounts.len();
+
+    if rt_count == 0 {
+        return Json(json!({
+            "total": total, "refreshed": 0, "success": 0, "fail": 0, "skipped": total,
+        })).into_response();
+    }
+
+    info!(total, rt_count, "批量刷新令牌开始");
+
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(20));
+    let mut handles = Vec::with_capacity(rt_count);
+
+    for acc in rt_accounts {
+        let acc = Arc::clone(acc);
+        let sem = semaphore.clone();
+        let state = state.clone();
+
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            let rt = acc.refresh_token.read().clone();
+            let client = reqwest::Client::new();
+
+            match token::refresh::refresh_with_retry(&client, &rt).await {
+                Ok(resp) => {
+                    let info = token::parse_id_token(&resp.id_token).unwrap_or_default();
+                    let expires_at = chrono::Utc::now() + chrono::Duration::seconds(resp.expires_in);
+
+                    *acc.access_token.write() = resp.access_token.clone();
+                    if !resp.refresh_token.is_empty() {
+                        *acc.refresh_token.write() = resp.refresh_token.clone();
+                    }
+                    *acc.expires_at.write() = expires_at;
+                    if !info.email.is_empty() {
+                        *acc.email.write() = info.email.clone();
+                    }
+                    if !info.chatgpt_plan_type.is_empty() {
+                        *acc.plan_type.write() = info.chatgpt_plan_type.clone();
+                    }
+
+                    // 更新数据库
+                    let creds = Credentials {
+                        refresh_token: acc.refresh_token.read().clone(),
+                        access_token: resp.access_token,
+                        id_token: resp.id_token,
+                        expires_at: expires_at.to_rfc3339(),
+                        email: info.email,
+                        account_id: info.chatgpt_account_id,
+                        plan_type: info.chatgpt_plan_type,
+                        ..Default::default()
+                    };
+                    let _ = queries::update_account_credentials(&state.db(), acc.db_id, &creds).await;
+
+                    true
+                }
+                Err(e) => {
+                    warn!(account_id = acc.db_id, error = %e, "批量刷新失败");
+                    false
+                }
+            }
+        }));
+    }
+
+    let mut success = 0u32;
+    let mut fail = 0u32;
+    for h in handles {
+        match h.await {
+            Ok(true) => success += 1,
+            _ => fail += 1,
+        }
+    }
+
+    let skipped = total as u32 - success - fail;
+    info!(success, fail, skipped, "批量刷新令牌完成");
+
+    Json(json!({
+        "total": total,
+        "refreshed": success + fail,
+        "success": success,
+        "fail": fail,
+        "skipped": skipped,
+    })).into_response()
 }
 
 /// GET /api/admin/accounts/{id}/usage → AccountUsageDetail
@@ -812,20 +919,62 @@ pub async fn batch_test(
 
     let accounts = state.scheduler.all_accounts();
     let total = accounts.len();
-    let mut success = 0usize;
-    let mut failed = 0usize;
-    let mut banned = 0usize;
-    let mut rate_limited = 0usize;
+    if total == 0 {
+        return Json(json!({
+            "total": 0, "success": 0, "failed": 0,
+            "banned": 0, "rate_limited": 0, "recovered": 0,
+        })).into_response();
+    }
+
+    let (test_model, concurrency) = {
+        let s = state.db_settings_cache.read().unwrap();
+        (s.test_model.clone(), (s.test_concurrency as usize).max(1))
+    };
+
+    info!(total, concurrency, model = %test_model, "批量测试开始");
+
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut handles = Vec::with_capacity(total);
 
     for acc in &accounts {
-        let tier = acc.health_tier.load(Ordering::Relaxed);
-        match tier {
-            scheduler::TIER_BANNED => banned += 1,
-            _ if acc.is_in_cooldown() => rate_limited += 1,
-            _ if acc.is_available() => success += 1,
-            _ => failed += 1,
+        // 跳过无 token 的账号
+        if acc.access_token.read().is_empty() {
+            continue;
+        }
+
+        let acc = Arc::clone(acc);
+        let state = state.clone();
+        let sem = semaphore.clone();
+        let model = test_model.clone();
+
+        handles.push(tokio::spawn(async move {
+            let _permit = sem.acquire().await.unwrap();
+            batch_test_one(&state, &acc, &model).await
+        }));
+    }
+
+    let mut success = 0u32;
+    let mut failed = 0u32;
+    let mut banned = 0u32;
+    let mut rate_limited = 0u32;
+    let mut recovered = 0u32;
+
+    for h in handles {
+        if let Ok(result) = h.await {
+            match result {
+                BatchTestResult::Success => success += 1,
+                BatchTestResult::Recovered => { recovered += 1; success += 1; }
+                BatchTestResult::RateLimited => rate_limited += 1,
+                BatchTestResult::Banned => banned += 1,
+                BatchTestResult::Failed => failed += 1,
+            }
         }
     }
+
+    info!(
+        total, success, failed, banned, rate_limited, recovered,
+        "批量测试完成"
+    );
 
     Json(json!({
         "total": total,
@@ -833,8 +982,157 @@ pub async fn batch_test(
         "failed": failed,
         "banned": banned,
         "rate_limited": rate_limited,
-    }))
-    .into_response()
+        "recovered": recovered,
+    })).into_response()
+}
+
+enum BatchTestResult {
+    Success,
+    Recovered,
+    RateLimited,
+    Banned,
+    Failed,
+}
+
+/// 单个账号的批量测试逻辑
+async fn batch_test_one(
+    state: &AppState,
+    acc: &Arc<Account>,
+    model: &str,
+) -> BatchTestResult {
+    let access_token = acc.access_token.read().clone();
+    let proxy_url = acc.proxy_url.read().clone();
+    let codex_account_id = acc.codex_account_id.read().clone();
+    let account_id_str = acc.db_id.to_string();
+    let email = acc.email.read().clone();
+
+    let payload = json!({
+        "model": model,
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        "stream": false,
+        "store": false,
+        "instructions": "",
+    });
+
+    let upstream_url = format!("{}/responses", crate::proxy::UPSTREAM_BASE);
+    let ua = crate::proxy::useragent::ua_for_account(&account_id_str);
+    let version = crate::proxy::useragent::version_from_ua(ua);
+    let client = crate::proxy::handler::get_or_create_client(state, &proxy_url);
+
+    let mut req = client
+        .post(&upstream_url)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header("User-Agent", ua)
+        .header("Version", version)
+        .header("Originator", crate::proxy::ORIGINATOR)
+        .json(&payload)
+        .timeout(std::time::Duration::from_secs(30));
+
+    if !codex_account_id.is_empty() {
+        req = req.header("Chatgpt-Account-Id", &codex_account_id);
+    }
+
+    let start = std::time::Instant::now();
+
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(account_id = acc.db_id, email = %email, error = %e, "批量测试 — 请求失败");
+            return BatchTestResult::Failed;
+        }
+    };
+
+    let status = resp.status().as_u16();
+    let latency = start.elapsed().as_millis() as u64;
+    let resp_headers = resp.headers().clone();
+
+    // 刷新用量 header
+    crate::proxy::handler::update_usage_from_headers(acc, &resp_headers);
+
+    match status {
+        200 => {
+            acc.report_success(latency);
+            state.scheduler.recompute_health(acc);
+
+            // 检查用量：如果之前处于冷却，且用量 < 100%，尝试恢复
+            let usage_7d = acc.usage_7d_pct_100.load(Ordering::Relaxed);
+            let usage_5h = acc.usage_5h_pct_100.load(Ordering::Relaxed);
+            let was_cooldown = acc.is_in_cooldown();
+            let resets_at = acc.resets_at.load(Ordering::Relaxed);
+
+            if (was_cooldown || resets_at > 0) && usage_7d < 10000 && usage_5h < 10000 {
+                acc.resets_at.store(0, Ordering::Relaxed);
+                acc.usage_7d_pct_100.store(0, Ordering::Relaxed);
+                acc.usage_5h_pct_100.store(0, Ordering::Relaxed);
+                state.scheduler.try_recover(acc);
+
+                let db = state.db();
+                let aid = acc.db_id;
+                tokio::spawn(async move {
+                    let _ = queries::clear_account_usage_state(&db, aid).await;
+                });
+
+                info!(
+                    account_id = acc.db_id, email = %email, latency,
+                    "批量测试 200 — 账号已恢复调度"
+                );
+                return BatchTestResult::Recovered;
+            }
+
+            info!(
+                account_id = acc.db_id, email = %email, latency,
+                usage_7d = usage_7d as f64 / 100.0,
+                "批量测试 200"
+            );
+            BatchTestResult::Success
+        }
+        429 => {
+            acc.report_failure(scheduler::FailureType::RateLimited);
+
+            // 解析 resets_at（仅首次）
+            let body = resp.text().await.unwrap_or_default();
+            if acc.resets_at.load(Ordering::Relaxed) == 0 {
+                if let Ok(body_json) = serde_json::from_str::<serde_json::Value>(&body) {
+                    if let Some(ts) = body_json.pointer("/error/resets_at").and_then(|v| v.as_i64()) {
+                        acc.resets_at.store(ts, Ordering::Relaxed);
+                        let db = state.db();
+                        let aid = acc.db_id;
+                        tokio::spawn(async move {
+                            let _ = queries::update_account_resets_at(&db, aid, ts).await;
+                        });
+                    }
+                }
+            }
+
+            // 设置冷却
+            let cooldown = crate::proxy::handler::parse_rate_limit_cooldown(
+                &resp_headers, &body, acc,
+            );
+            state.scheduler.mark_cooldown(acc, "rate_limited", cooldown);
+
+            warn!(
+                account_id = acc.db_id, email = %email, cooldown,
+                "批量测试 429"
+            );
+            BatchTestResult::RateLimited
+        }
+        401 => {
+            acc.report_failure(scheduler::FailureType::Unauthorized);
+            state.scheduler.mark_banned(acc);
+
+            warn!(account_id = acc.db_id, email = %email, "批量测试 401");
+            BatchTestResult::Banned
+        }
+        _ => {
+            acc.report_failure(scheduler::FailureType::Other);
+            state.scheduler.recompute_health(acc);
+
+            warn!(account_id = acc.db_id, email = %email, status, "批量测试失败");
+            BatchTestResult::Failed
+        }
+    }
 }
 
 // ─── 使用统计 & 图表 ───
@@ -1607,6 +1905,7 @@ async fn import_at_txt(
                         *account.codex_account_id.write() = info.chatgpt_account_id;
                         *account.expires_at.write() = expires_at;
                         state.scheduler.add_account(account);
+                        queries::insert_account_event(&state.db(), id, "added", "import_at").await;
                         success.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(_) => {
@@ -1755,6 +2054,7 @@ async fn import_rt_txt(
                             *account.refresh_token.write() = creds.refresh_token;
                             *account.expires_at.write() = expires_at;
                             state.scheduler.add_account(account);
+                            queries::insert_account_event(&state.db(), id, "added", "import_rt").await;
                             success.fetch_add(1, Ordering::Relaxed);
                         } else {
                             failed.fetch_add(1, Ordering::Relaxed);

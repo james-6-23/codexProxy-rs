@@ -14,9 +14,9 @@ import { api } from '../api'
 import { Card, CardContent } from '@/components/ui/card'
 import type { AccountEventTrendPoint } from '../types'
 
-type TrendRange = '24h' | '7d' | '30d'
+type TrendRange = '1h' | '6h' | '12h' | '24h' | '7d' | '30d'
 
-const RANGE_OPTIONS: TrendRange[] = ['24h', '7d', '30d']
+const RANGE_OPTIONS: TrendRange[] = ['1h', '6h', '12h', '24h', '7d', '30d']
 
 const chartMargin = { top: 8, right: 12, left: -12, bottom: 0 }
 const gridColor = 'var(--color-border)'
@@ -32,8 +32,11 @@ const tooltipItemStyle = { color: 'var(--color-foreground)' }
 
 function getRangeConfig(range: TrendRange) {
   switch (range) {
-    case '24h': return { bucketMinutes: 60, offsetMs: 24 * 3600_000 }
-    case '7d':  return { bucketMinutes: 360, offsetMs: 7 * 86400_000 }
+    case '1h':  return { bucketMinutes: 5,    offsetMs: 3600_000 }
+    case '6h':  return { bucketMinutes: 15,   offsetMs: 6 * 3600_000 }
+    case '12h': return { bucketMinutes: 30,   offsetMs: 12 * 3600_000 }
+    case '24h': return { bucketMinutes: 60,   offsetMs: 24 * 3600_000 }
+    case '7d':  return { bucketMinutes: 360,  offsetMs: 7 * 86400_000 }
     case '30d': return { bucketMinutes: 1440, offsetMs: 30 * 86400_000 }
   }
 }
@@ -55,7 +58,7 @@ interface DisplayPoint {
 
 export default function AccountTrendChart() {
   const { t } = useTranslation()
-  const [range, setRange] = useState<TrendRange>('7d')
+  const [range, setRange] = useState<TrendRange>('1h')
   const [rawData, setRawData] = useState<AccountEventTrendPoint[]>([])
   const [loading, setLoading] = useState(false)
 
@@ -98,7 +101,7 @@ export default function AccountTrendChart() {
       if (bucketMinutes >= 1440) {
         label = `${mm}-${dd}`
         fullLabel = `${d.getFullYear()}-${mm}-${dd}`
-      } else if (bucketMinutes >= 360) {
+      } else if (bucketMinutes >= 60) {
         label = `${mm}-${dd} ${hh}:00`
         fullLabel = `${mm}-${dd} ${hh}:${mi}`
       } else {

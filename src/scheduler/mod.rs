@@ -66,6 +66,9 @@ pub struct Account {
     pub usage_7d_pct_100: AtomicI64,
     pub usage_5h_pct_100: AtomicI64,
 
+    // 上游用量重置时间（unix timestamp，0 = 无计划探针）
+    pub resets_at: AtomicI64,
+
     // 时间戳（unix）
     pub last_success_at: AtomicI64,
     pub last_failure_at: AtomicI64,
@@ -141,6 +144,7 @@ impl Account {
             recent_results: RwLock::new(RecentWindow::default()),
             usage_7d_pct_100: AtomicI64::new(0),
             usage_5h_pct_100: AtomicI64::new(0),
+            resets_at: AtomicI64::new(0),
             last_success_at: AtomicI64::new(0),
             last_failure_at: AtomicI64::new(0),
             last_unauthorized_at: AtomicI64::new(0),

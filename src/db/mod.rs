@@ -74,7 +74,7 @@ async fn create_tables(pool: &PgPool) -> Result<()> {
             id                      INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
             max_concurrency         INT NOT NULL DEFAULT 2,
             global_rpm              INT NOT NULL DEFAULT 0,
-            test_model              TEXT NOT NULL DEFAULT 'o4-mini',
+            test_model              TEXT NOT NULL DEFAULT 'gpt-5.4-mini',
             test_concurrency        INT NOT NULL DEFAULT 50,
             proxy_url               TEXT NOT NULL DEFAULT '',
             admin_secret            TEXT NOT NULL DEFAULT '',

@@ -1056,7 +1056,6 @@ async fn batch_test_one(
             acc.report_success(latency);
             state.scheduler.recompute_health(acc);
 
-            // 检查用量：如果之前处于冷却，且用量 < 100%，尝试恢复
             let usage_7d = acc.usage_7d_pct_100.load(Ordering::Relaxed);
             let usage_5h = acc.usage_5h_pct_100.load(Ordering::Relaxed);
             let was_cooldown = acc.is_in_cooldown();
@@ -1071,6 +1070,26 @@ async fn batch_test_one(
                 let _ = queries::persist_account_usage(&db, aid, u7d, u5h).await;
             });
 
+            // 用量 ≥ 100% — 标记为限流，即使 200 也不该继续调度
+            if usage_7d >= 10000 || usage_5h >= 10000 {
+                // 从 header 的 reset-after-seconds 计算冷却时间，fallback 7 天
+                let resets_at_cur = acc.resets_at.load(Ordering::Relaxed);
+                if resets_at_cur > 0 {
+                    let cooldown = (resets_at_cur - chrono::Utc::now().timestamp()).max(60);
+                    state.scheduler.mark_cooldown(acc, "rate_limited", cooldown);
+                } else {
+                    state.scheduler.mark_cooldown(acc, "rate_limited", 7 * 24 * 3600);
+                }
+
+                warn!(
+                    account_id = acc.db_id, email = %email, latency,
+                    usage_7d = u7d, usage_5h = u5h,
+                    "批量测试 200 但用量已满 — 标记限流"
+                );
+                return BatchTestResult::RateLimited;
+            }
+
+            // 之前限流且用量已恢复 → 恢复调度
             if (was_cooldown || resets_at > 0) && usage_7d < 10000 && usage_5h < 10000 {
                 acc.resets_at.store(0, Ordering::Relaxed);
                 acc.usage_7d_pct_100.store(0, Ordering::Relaxed);

@@ -928,31 +928,89 @@ fn resolve_session_id(body: &Value, downstream_headers: &HeaderMap, account_id: 
     uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, seed.as_bytes()).to_string()
 }
 
-/// 从上游响应 header 提取用量百分比并更新到 Account
+/// 从上游响应 header 解析用量百分比并更新到 Account
 ///
-/// 上游每次响应都会返回：
-/// - `x-codex-primary-used-percent` → 5h 窗口用量百分比
-/// - `x-codex-secondary-used-percent` → 7d 窗口用量百分比
+/// 上游返回两组窗口 header（primary / secondary），通过 window-minutes 判断哪个是 5h / 7d：
+/// - `x-codex-{primary,secondary}-used-percent` — 用量百分比
+/// - `x-codex-{primary,secondary}-window-minutes` — 窗口大小（分钟）
+/// - `x-codex-{primary,secondary}-reset-after-seconds` — 重置剩余秒数
 pub(crate) fn update_usage_from_headers(account: &crate::scheduler::Account, headers: &HeaderMap) {
-    if let Some(primary) = headers
-        .get("x-codex-primary-used-percent")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<f64>().ok())
-    {
-        // 5h 窗口 → usage_5h_pct_100（×100 存储）
-        account
-            .usage_5h_pct_100
-            .store((primary * 100.0) as i64, std::sync::atomic::Ordering::Relaxed);
+    let parse_hdr = |name: &str| -> Option<f64> {
+        headers.get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<f64>().ok())
+    };
+
+    let primary_pct = parse_hdr("x-codex-primary-used-percent");
+    let primary_win = parse_hdr("x-codex-primary-window-minutes");
+    let secondary_pct = parse_hdr("x-codex-secondary-used-percent");
+    let secondary_win = parse_hdr("x-codex-secondary-window-minutes");
+
+    // 没有任何用量 header → 直接返回
+    if primary_pct.is_none() && secondary_pct.is_none() {
+        return;
     }
-    if let Some(secondary) = headers
-        .get("x-codex-secondary-used-percent")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<f64>().ok())
-    {
-        // 7d 窗口 → usage_7d_pct_100（×100 存储）
-        account
-            .usage_7d_pct_100
-            .store((secondary * 100.0) as i64, std::sync::atomic::Ordering::Relaxed);
+
+    // 通过 window-minutes 归一化：大窗口 → 7d，小窗口 → 5h
+    let (pct_5h, pct_7d) = match (primary_pct, primary_win, secondary_pct, secondary_win) {
+        // 两个窗口都存在 — 比较 window-minutes 决定大小
+        (Some(p_pct), Some(p_win), Some(s_pct), Some(s_win)) => {
+            if p_win >= s_win {
+                (Some(s_pct), Some(p_pct)) // primary 是大窗口(7d)，secondary 是小窗口(5h)
+            } else {
+                (Some(p_pct), Some(s_pct)) // primary 是小窗口(5h)，secondary 是大窗口(7d)
+            }
+        }
+        // 只有 primary — 根据 window-minutes 判断归属
+        (Some(p_pct), p_win, None, _) => {
+            if p_win.unwrap_or(10080.0) > 360.0 {
+                (None, Some(p_pct)) // 大窗口 → 7d
+            } else {
+                (Some(p_pct), None) // 小窗口 → 5h
+            }
+        }
+        // 只有 secondary
+        (None, _, Some(s_pct), s_win) => {
+            if s_win.unwrap_or(10080.0) > 360.0 {
+                (None, Some(s_pct)) // 大窗口 → 7d
+            } else {
+                (Some(s_pct), None) // 小窗口 → 5h
+            }
+        }
+        _ => return,
+    };
+
+    if let Some(pct) = pct_5h {
+        account.usage_5h_pct_100.store(
+            (pct * 100.0) as i64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    if let Some(pct) = pct_7d {
+        account.usage_7d_pct_100.store(
+            (pct * 100.0) as i64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    // 同时从 reset-after-seconds 更新 resets_at（如果当前无探针计划）
+    if account.resets_at.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        // 取大窗口的 reset 秒数
+        let reset_sec = parse_hdr("x-codex-primary-reset-after-seconds")
+            .zip(primary_win)
+            .and_then(|(sec, win)| if win > 360.0 { Some(sec) } else { None })
+            .or_else(|| {
+                parse_hdr("x-codex-secondary-reset-after-seconds")
+                    .zip(secondary_win)
+                    .and_then(|(sec, win)| if win > 360.0 { Some(sec) } else { None })
+            });
+
+        if let Some(sec) = reset_sec {
+            if sec > 0.0 {
+                let ts = chrono::Utc::now().timestamp() + sec as i64;
+                account.resets_at.store(ts, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
 }
 

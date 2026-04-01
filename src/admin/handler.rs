@@ -745,7 +745,11 @@ pub async fn test_connection(
                 let line = buffer[..pos].to_string();
                 buffer = buffer[pos + 2..].to_string();
 
-                let data = line.strip_prefix("data: ").unwrap_or(&line);
+                // SSE 事件可能是多行（event: ...\ndata: ...），提取 data: 行
+                let data = line
+                    .lines()
+                    .find_map(|l| l.strip_prefix("data: "))
+                    .unwrap_or("");
                 if data.is_empty() || data == "[DONE]" {
                     continue;
                 }

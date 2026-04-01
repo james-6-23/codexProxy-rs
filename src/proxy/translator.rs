@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 // ─── Codex 不支持的字段（传了会 400）───
@@ -20,6 +21,139 @@ const UNSUPPORTED_SCHEMA_KEYS: &[&str] = &[
     "additionalItems", "patternProperties", "dependencies",
     "if", "then", "else", "allOf", "anyOf", "oneOf", "not",
 ];
+
+// ─── 输出侧类型化结构体（零堆分配序列化）───
+
+#[derive(Serialize)]
+struct ChatChunk<'a> {
+    id: &'a str,
+    object: &'static str,
+    choices: [ChunkChoice<'a>; 1],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<ChunkUsage>,
+}
+
+#[derive(Serialize)]
+struct ChunkChoice<'a> {
+    index: u32,
+    delta: ChunkDelta<'a>,
+    finish_reason: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct ChunkDelta<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<[ToolCallChunk<'a>; 1]>,
+}
+
+#[derive(Serialize)]
+struct ToolCallChunk<'a> {
+    index: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<&'a str>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    call_type: Option<&'static str>,
+    function: ToolCallFunc<'a>,
+}
+
+#[derive(Serialize)]
+struct ToolCallFunc<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+    arguments: &'a str,
+}
+
+#[derive(Serialize)]
+struct ChunkUsage {
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    total_tokens: i64,
+    reasoning_tokens: i64,
+    cached_tokens: i64,
+}
+
+// ─── 输入侧类型化结构体（零拷贝反序列化）───
+
+/// SSE 事件通用结构 — 所有字段 Option，按 event_type 取用
+#[derive(Deserialize)]
+struct SseEvent<'a> {
+    #[serde(rename = "type")]
+    event_type: &'a str,
+    #[serde(default)]
+    response_id: Option<&'a str>,
+    #[serde(default)]
+    delta: Option<&'a str>,
+    #[serde(default)]
+    item_id: Option<&'a str>,
+    #[serde(default, borrow)]
+    item: Option<SseItem<'a>>,
+    #[serde(default, borrow)]
+    response: Option<SseResponse<'a>>,
+}
+
+#[derive(Deserialize)]
+struct SseItem<'a> {
+    #[serde(default)]
+    id: Option<&'a str>,
+    #[serde(rename = "type", default)]
+    item_type: Option<&'a str>,
+    #[serde(default)]
+    call_id: Option<&'a str>,
+    #[serde(default)]
+    name: Option<&'a str>,
+}
+
+#[derive(Deserialize)]
+struct SseResponse<'a> {
+    #[serde(default)]
+    id: Option<&'a str>,
+    #[serde(default)]
+    service_tier: Option<&'a str>,
+    #[serde(default)]
+    usage: Option<UsageRaw>,
+    #[serde(default, borrow)]
+    status_details: Option<StatusDetailsRaw<'a>>,
+}
+
+#[derive(Deserialize)]
+struct UsageRaw {
+    #[serde(default)]
+    input_tokens: Option<i64>,
+    #[serde(default)]
+    output_tokens: Option<i64>,
+    #[serde(default)]
+    output_tokens_details: Option<OutputTokensDetails>,
+    #[serde(default)]
+    input_tokens_details: Option<InputTokensDetails>,
+}
+
+#[derive(Deserialize)]
+struct OutputTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct InputTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct StatusDetailsRaw<'a> {
+    #[serde(default, borrow)]
+    error: Option<ErrorDetailRaw<'a>>,
+}
+
+#[derive(Deserialize)]
+struct ErrorDetailRaw<'a> {
+    #[serde(default)]
+    message: Option<&'a str>,
+}
+
+// ─── 请求翻译 ───
 
 /// 将 OpenAI Chat Completions 格式翻译为 Codex Responses 格式
 pub fn translate_chat_to_responses(chat_body: &Value) -> Value {
@@ -97,7 +231,6 @@ fn convert_messages_to_input(messages: &[Value]) -> Value {
 
         match role {
             "system" | "developer" => {
-                // system → developer
                 let mut item = json!({"role": "developer"});
                 if let Some(c) = msg.get("content") {
                     item["content"] = c.clone();
@@ -105,7 +238,6 @@ fn convert_messages_to_input(messages: &[Value]) -> Value {
                 input.push(item);
             }
             "tool" => {
-                // tool 响应 → function_call_output
                 input.push(json!({
                     "type": "function_call_output",
                     "call_id": msg.get("tool_call_id").unwrap_or(&Value::Null),
@@ -113,7 +245,6 @@ fn convert_messages_to_input(messages: &[Value]) -> Value {
                 }));
             }
             "assistant" => {
-                // assistant + tool_calls → function_call items
                 if let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {
                     for tc in tool_calls {
                         let func = tc.get("function").unwrap_or(&Value::Null);
@@ -125,7 +256,6 @@ fn convert_messages_to_input(messages: &[Value]) -> Value {
                         }));
                     }
                 }
-                // assistant 文本内容
                 if let Some(content) = msg.get("content") {
                     if !content.is_null() {
                         let mut item = json!({"role": "assistant"});
@@ -135,7 +265,6 @@ fn convert_messages_to_input(messages: &[Value]) -> Value {
                 }
             }
             _ => {
-                // user 等角色直接映射
                 let mut item = json!({"role": role});
                 if let Some(c) = msg.get("content") {
                     item["content"] = c.clone();
@@ -179,13 +308,11 @@ fn strip_unsupported_schema_keys(schema: &mut Value) {
         for key in UNSUPPORTED_SCHEMA_KEYS {
             obj.remove(*key);
         }
-        // 递归处理 properties
         if let Some(props) = obj.get_mut("properties").and_then(|v| v.as_object_mut()) {
             for (_, prop_val) in props.iter_mut() {
                 strip_unsupported_schema_keys(prop_val);
             }
         }
-        // 递归处理 items
         if let Some(items) = obj.get_mut("items") {
             strip_unsupported_schema_keys(items);
         }
@@ -198,7 +325,6 @@ pub fn strip_unsupported_fields(body: &mut Value) {
         for field in UNSUPPORTED_FIELDS {
             obj.remove(*field);
         }
-        // 清理可能导致上游报错的字段
         obj.remove("previous_response_id");
         obj.remove("prompt_cache_retention");
         obj.remove("safety_identifier");
@@ -218,7 +344,7 @@ pub struct UsageInfo {
     pub total_tokens: i64,
 }
 
-/// 从 Codex 响应 JSON 提取 usage
+/// 从 Codex 响应 JSON 提取 usage（供 translate_response_to_chat 使用）
 pub fn extract_usage(resp: &Value) -> UsageInfo {
     let usage = resp.get("usage").unwrap_or(&Value::Null);
     let input = usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -242,6 +368,31 @@ pub fn extract_usage(resp: &Value) -> UsageInfo {
         reasoning_tokens: reasoning,
         cached_tokens: cached,
         total_tokens: input + output,
+    }
+}
+
+/// 从类型化 UsageRaw 提取 UsageInfo（零拷贝路径）
+fn extract_usage_from_raw(raw: &Option<UsageRaw>) -> UsageInfo {
+    match raw {
+        Some(u) => {
+            let input = u.input_tokens.unwrap_or(0);
+            let output = u.output_tokens.unwrap_or(0);
+            let reasoning = u.output_tokens_details.as_ref()
+                .and_then(|d| d.reasoning_tokens).unwrap_or(0);
+            let cached = u.input_tokens_details.as_ref()
+                .and_then(|d| d.cached_tokens).unwrap_or(0);
+            UsageInfo {
+                input_tokens: input,
+                output_tokens: output,
+                reasoning_tokens: reasoning,
+                cached_tokens: cached,
+                total_tokens: input + output,
+            }
+        }
+        None => UsageInfo {
+            input_tokens: 0, output_tokens: 0, reasoning_tokens: 0,
+            cached_tokens: 0, total_tokens: 0,
+        },
     }
 }
 
@@ -355,7 +506,6 @@ impl StreamTranslator {
     }
 
     /// 从 pending 缓冲中提取完整的行，返回完整行列表
-    /// 不完整的尾部数据保留在 pending 中
     fn drain_lines(&mut self, new_data: &str) -> Vec<String> {
         self.pending.push_str(new_data);
         let mut lines = Vec::new();
@@ -368,12 +518,34 @@ impl StreamTranslator {
             start = end + 1;
         }
 
-        // 一次性截断已消费部分，避免反复重建 pending
         if start > 0 {
             self.pending.drain(..start);
         }
 
         lines
+    }
+
+    /// 从 SSE 事件 JSON 更新内部状态（delta 字符数、usage、completed）
+    fn update_state_from_event(&mut self, json_str: &str) {
+        if let Ok(event) = serde_json::from_str::<SseEvent>(json_str) {
+            match event.event_type {
+                "response.output_text.delta" => {
+                    self.first_delta_received = true;
+                    self.delta_chars += event.delta.map(|s| s.len()).unwrap_or(0);
+                }
+                "response.completed" => {
+                    self.completed = true;
+                    if let Some(ref resp) = event.response {
+                        self.usage = Some(extract_usage_from_raw(&resp.usage));
+                        self.service_tier = resp.service_tier.unwrap_or("").to_string();
+                    }
+                }
+                "response.failed" => {
+                    self.completed = true;
+                }
+                _ => {}
+            }
+        }
     }
 
     /// 流结束后冲刷 pending 缓冲中残留的数据
@@ -384,35 +556,10 @@ impl StreamTranslator {
         let remaining = std::mem::take(&mut self.pending);
         for line in remaining.lines() {
             let line = line.trim();
-            if let Some(json_str) = line.strip_prefix("data: ") {
-                if json_str == "[DONE]" {
-                    continue;
-                }
-                if let Ok(event) = serde_json::from_str::<Value>(json_str) {
-                    let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                    match event_type {
-                        "response.output_text.delta" => {
-                            self.first_delta_received = true;
-                            self.delta_chars += event
-                                .get("delta")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.len())
-                                .unwrap_or(0);
-                        }
-                        "response.completed" => {
-                            self.completed = true;
-                            if let Some(resp) = event.get("response") {
-                                self.usage = Some(extract_usage(resp));
-                                self.service_tier = resp
-                                    .get("service_tier")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                            }
-                        }
-                        _ => {}
-                    }
-                }
+            if let Some(json_str) = line.strip_prefix("data: ")
+                && json_str != "[DONE]"
+            {
+                self.update_state_from_event(json_str);
             }
         }
     }
@@ -421,7 +568,7 @@ impl StreamTranslator {
     pub fn translate_chunk(&mut self, data: &[u8]) -> Result<Vec<u8>, anyhow::Error> {
         let text = std::str::from_utf8(data)?;
         let lines = self.drain_lines(text);
-        let mut output = Vec::new();
+        let mut output = Vec::with_capacity(256);
 
         for line in &lines {
             if let Some(json_str) = line.strip_prefix("data: ") {
@@ -430,156 +577,174 @@ impl StreamTranslator {
                     continue;
                 }
 
-                if let Ok(event) = serde_json::from_str::<Value>(json_str) {
-                    let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                    let response_id = event.get("response_id").unwrap_or(&Value::Null);
+                match serde_json::from_str::<SseEvent>(json_str) {
+                    Ok(event) => {
+                        let rid = event.response_id.unwrap_or("");
 
-                    match event_type {
-                        // 文本 delta
-                        "response.output_text.delta" => {
-                            let delta_text = event.get("delta").and_then(|v| v.as_str()).unwrap_or("");
-                            self.first_delta_received = true;
-                            self.delta_chars += delta_text.len();
+                        match event.event_type {
+                            // 文本 delta
+                            "response.output_text.delta" => {
+                                let delta_text = event.delta.unwrap_or("");
+                                self.first_delta_received = true;
+                                self.delta_chars += delta_text.len();
 
-                            let chunk = json!({
-                                "id": response_id,
-                                "object": "chat.completion.chunk",
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": { "content": delta_text },
-                                    "finish_reason": Value::Null,
-                                }],
-                            });
-                            output.extend_from_slice(
-                                format!("data: {}\n\n", serde_json::to_string(&chunk)?).as_bytes(),
-                            );
-                        }
+                                let chunk = ChatChunk {
+                                    id: rid,
+                                    object: "chat.completion.chunk",
+                                    choices: [ChunkChoice {
+                                        index: 0,
+                                        delta: ChunkDelta {
+                                            content: Some(delta_text),
+                                            tool_calls: None,
+                                        },
+                                        finish_reason: None,
+                                    }],
+                                    usage: None,
+                                };
+                                output.extend_from_slice(b"data: ");
+                                serde_json::to_writer(&mut output, &chunk)?;
+                                output.extend_from_slice(b"\n\n");
+                            }
 
-                        // function_call 参数增量
-                        "response.function_call_arguments.delta" => {
-                            let item_id = event.get("item_id").and_then(|v| v.as_str()).unwrap_or("");
-                            let delta_args = event.get("delta").and_then(|v| v.as_str()).unwrap_or("");
-                            self.first_delta_received = true;
+                            // function_call 参数增量
+                            "response.function_call_arguments.delta" => {
+                                let item_id = event.item_id.unwrap_or("");
+                                let delta_args = event.delta.unwrap_or("");
+                                self.first_delta_received = true;
 
-                            let idx = *self.tool_call_indices.entry(item_id.to_string()).or_insert_with(|| {
-                                let i = self.next_tool_index;
-                                self.next_tool_index += 1;
-                                i
-                            });
-
-                            let chunk = json!({
-                                "id": response_id,
-                                "object": "chat.completion.chunk",
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {
-                                        "tool_calls": [{
-                                            "index": idx,
-                                            "function": { "arguments": delta_args },
-                                        }]
-                                    },
-                                    "finish_reason": Value::Null,
-                                }],
-                            });
-                            output.extend_from_slice(
-                                format!("data: {}\n\n", serde_json::to_string(&chunk)?).as_bytes(),
-                            );
-                        }
-
-                        // function_call 创建（发送 name）
-                        "response.output_item.added" => {
-                            if let Some(item) = event.get("item") {
-                                let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                                if item_type == "function_call" {
-                                    let item_id = item.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                                    let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                                    let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
-
-                                    let idx = *self.tool_call_indices.entry(item_id.to_string()).or_insert_with(|| {
+                                let idx = *self.tool_call_indices
+                                    .entry(item_id.to_string())
+                                    .or_insert_with(|| {
                                         let i = self.next_tool_index;
                                         self.next_tool_index += 1;
                                         i
                                     });
 
-                                    let chunk = json!({
-                                        "id": response_id,
-                                        "object": "chat.completion.chunk",
-                                        "choices": [{
-                                            "index": 0,
-                                            "delta": {
-                                                "tool_calls": [{
-                                                    "index": idx,
-                                                    "id": call_id,
-                                                    "type": "function",
-                                                    "function": { "name": name, "arguments": "" },
-                                                }]
-                                            },
-                                            "finish_reason": Value::Null,
-                                        }],
-                                    });
-                                    output.extend_from_slice(
-                                        format!("data: {}\n\n", serde_json::to_string(&chunk)?).as_bytes(),
-                                    );
+                                let chunk = ChatChunk {
+                                    id: rid,
+                                    object: "chat.completion.chunk",
+                                    choices: [ChunkChoice {
+                                        index: 0,
+                                        delta: ChunkDelta {
+                                            content: None,
+                                            tool_calls: Some([ToolCallChunk {
+                                                index: idx,
+                                                id: None,
+                                                call_type: None,
+                                                function: ToolCallFunc {
+                                                    name: None,
+                                                    arguments: delta_args,
+                                                },
+                                            }]),
+                                        },
+                                        finish_reason: None,
+                                    }],
+                                    usage: None,
+                                };
+                                output.extend_from_slice(b"data: ");
+                                serde_json::to_writer(&mut output, &chunk)?;
+                                output.extend_from_slice(b"\n\n");
+                            }
+
+                            // function_call 创建（发送 name）
+                            "response.output_item.added" => {
+                                if let Some(ref item) = event.item
+                                    && item.item_type == Some("function_call")
+                                {
+                                        let item_id = item.id.unwrap_or("");
+                                        let name = item.name.unwrap_or("");
+                                        let call_id = item.call_id.unwrap_or("");
+
+                                        let idx = *self.tool_call_indices
+                                            .entry(item_id.to_string())
+                                            .or_insert_with(|| {
+                                                let i = self.next_tool_index;
+                                                self.next_tool_index += 1;
+                                                i
+                                            });
+
+                                        let chunk = ChatChunk {
+                                            id: rid,
+                                            object: "chat.completion.chunk",
+                                            choices: [ChunkChoice {
+                                                index: 0,
+                                                delta: ChunkDelta {
+                                                    content: None,
+                                                    tool_calls: Some([ToolCallChunk {
+                                                        index: idx,
+                                                        id: Some(call_id),
+                                                        call_type: Some("function"),
+                                                        function: ToolCallFunc {
+                                                            name: Some(name),
+                                                            arguments: "",
+                                                        },
+                                                    }]),
+                                                },
+                                                finish_reason: None,
+                                            }],
+                                            usage: None,
+                                        };
+                                        output.extend_from_slice(b"data: ");
+                                        serde_json::to_writer(&mut output, &chunk)?;
+                                        output.extend_from_slice(b"\n\n");
                                 }
                             }
-                        }
 
-                        // 完成事件 — 提取 usage 和 service_tier
-                        "response.completed" => {
-                            self.completed = true;
+                            // 完成事件 — 提取 usage 和 service_tier
+                            "response.completed" => {
+                                self.completed = true;
 
-                            if let Some(resp) = event.get("response") {
-                                self.usage = Some(extract_usage(resp));
-                                self.service_tier = resp
-                                    .get("service_tier")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
+                                if let Some(ref resp) = event.response {
+                                    self.usage = Some(extract_usage_from_raw(&resp.usage));
+                                    self.service_tier = resp.service_tier.unwrap_or("").to_string();
+                                }
+
+                                let usage_json = self.usage.as_ref().map(|u| ChunkUsage {
+                                    prompt_tokens: u.input_tokens,
+                                    completion_tokens: u.output_tokens,
+                                    total_tokens: u.total_tokens,
+                                    reasoning_tokens: u.reasoning_tokens,
+                                    cached_tokens: u.cached_tokens,
+                                }).unwrap_or(ChunkUsage {
+                                    prompt_tokens: 0, completion_tokens: 0, total_tokens: 0,
+                                    reasoning_tokens: 0, cached_tokens: 0,
+                                });
+
+                                let final_rid = event.response.as_ref()
+                                    .and_then(|r| r.id)
+                                    .unwrap_or(rid);
+
+                                let chunk = ChatChunk {
+                                    id: final_rid,
+                                    object: "chat.completion.chunk",
+                                    choices: [ChunkChoice {
+                                        index: 0,
+                                        delta: ChunkDelta {
+                                            content: None,
+                                            tool_calls: None,
+                                        },
+                                        finish_reason: Some("stop"),
+                                    }],
+                                    usage: Some(usage_json),
+                                };
+                                output.extend_from_slice(b"data: ");
+                                serde_json::to_writer(&mut output, &chunk)?;
+                                output.extend_from_slice(b"\n\n");
+                                output.extend_from_slice(b"data: [DONE]\n\n");
                             }
 
-                            let usage_json = if let Some(ref u) = self.usage {
-                                json!({
-                                    "prompt_tokens": u.input_tokens,
-                                    "completion_tokens": u.output_tokens,
-                                    "total_tokens": u.total_tokens,
-                                    "reasoning_tokens": u.reasoning_tokens,
-                                    "cached_tokens": u.cached_tokens,
-                                })
-                            } else {
-                                json!({})
-                            };
-
-                            let rid = event
-                                .get("response")
-                                .and_then(|r| r.get("id"))
-                                .or(Some(response_id))
-                                .unwrap_or(&Value::Null);
-
-                            let chunk = json!({
-                                "id": rid,
-                                "object": "chat.completion.chunk",
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {},
-                                    "finish_reason": "stop",
-                                }],
-                                "usage": usage_json,
-                            });
-                            output.extend_from_slice(
-                                format!("data: {}\n\n", serde_json::to_string(&chunk)?).as_bytes(),
-                            );
-                            output.extend_from_slice(b"data: [DONE]\n\n");
-                        }
-
-                        // 其他事件透传
-                        _ => {
-                            output.extend_from_slice(line.as_bytes());
-                            output.extend_from_slice(b"\n\n");
+                            // 其他事件透传
+                            _ => {
+                                output.extend_from_slice(line.as_bytes());
+                                output.extend_from_slice(b"\n\n");
+                            }
                         }
                     }
-                } else {
-                    output.extend_from_slice(line.as_bytes());
-                    output.extend_from_slice(b"\n\n");
+                    // JSON 解析失败 → 透传
+                    Err(_) => {
+                        output.extend_from_slice(line.as_bytes());
+                        output.extend_from_slice(b"\n\n");
+                    }
                 }
             } else if !line.is_empty() {
                 output.extend_from_slice(line.as_bytes());
@@ -591,7 +756,6 @@ impl StreamTranslator {
     }
 
     /// 在 passthrough 模式下解析 SSE 事件，提取 usage / TTFT / delta 字符数
-    /// 不产生翻译输出，只更新内部状态
     pub fn track_raw_chunk(&mut self, data: &[u8]) {
         let text = match std::str::from_utf8(data) {
             Ok(t) => t,
@@ -601,38 +765,10 @@ impl StreamTranslator {
         let lines = self.drain_lines(text);
 
         for line in &lines {
-            let json_str = match line.strip_prefix("data: ") {
-                Some(s) if s != "[DONE]" => s,
-                _ => continue,
-            };
-
-            if let Ok(event) = serde_json::from_str::<Value>(json_str) {
-                let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                match event_type {
-                    "response.output_text.delta" => {
-                        self.first_delta_received = true;
-                        self.delta_chars += event
-                            .get("delta")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.len())
-                            .unwrap_or(0);
-                    }
-                    "response.completed" => {
-                        self.completed = true;
-                        if let Some(resp) = event.get("response") {
-                            self.usage = Some(extract_usage(resp));
-                            self.service_tier = resp
-                                .get("service_tier")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                        }
-                    }
-                    "response.failed" => {
-                        self.completed = true;
-                    }
-                    _ => {}
-                }
+            if let Some(json_str) = line.strip_prefix("data: ")
+                && json_str != "[DONE]"
+            {
+                self.update_state_from_event(json_str);
             }
         }
     }
@@ -647,5 +783,22 @@ impl StreamTranslator {
             cached_tokens: 0,
             total_tokens: estimated_output,
         }
+    }
+}
+
+// ─── 工具函数 ───
+
+/// 尝试解析 SSE 事件，如果是 response.failed 返回错误信息
+pub fn parse_sse_error(json_str: &str) -> Option<String> {
+    let event: SseEvent = serde_json::from_str(json_str).ok()?;
+    if event.event_type == "response.failed" {
+        let msg = event.response.as_ref()
+            .and_then(|r| r.status_details.as_ref())
+            .and_then(|d| d.error.as_ref())
+            .and_then(|e| e.message)
+            .unwrap_or("unknown upstream error");
+        Some(msg.to_string())
+    } else {
+        None
     }
 }

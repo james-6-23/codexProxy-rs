@@ -16,13 +16,14 @@ pub async fn refresh_access_token(
 
     let resp = client
         .post(TOKEN_URL)
+        .header("Accept", "application/json")
         .form(&[
             ("grant_type", "refresh_token"),
             ("client_id", CLIENT_ID),
             ("refresh_token", rt),
             ("scope", REFRESH_SCOPES),
         ])
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
         .send()
         .await?;
 
@@ -33,6 +34,7 @@ pub async fn refresh_access_token(
         if body.contains("invalid_grant")
             || body.contains("invalid_client")
             || body.contains("unauthorized_client")
+            || body.contains("access_denied")
         {
             bail!("non_retryable: {}", body);
         }

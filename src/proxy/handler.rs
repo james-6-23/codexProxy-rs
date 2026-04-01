@@ -8,6 +8,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
+use serde::Serialize;
 use serde_json::Value;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{error, info, warn};
@@ -36,21 +37,24 @@ pub async fn responses(
 
 /// GET /v1/models
 pub async fn list_models() -> impl IntoResponse {
-    let models: Vec<Value> = super::SUPPORTED_MODELS
+    #[derive(Serialize)]
+    struct ModelList<'a> {
+        object: &'static str,
+        data: Vec<ModelEntry<'a>>,
+    }
+    #[derive(Serialize)]
+    struct ModelEntry<'a> {
+        id: &'a str,
+        object: &'static str,
+        owned_by: &'static str,
+    }
+
+    let data: Vec<ModelEntry> = super::SUPPORTED_MODELS
         .iter()
-        .map(|m| {
-            serde_json::json!({
-                "id": m,
-                "object": "model",
-                "owned_by": "openai",
-            })
-        })
+        .map(|m| ModelEntry { id: m, object: "model", owned_by: "openai" })
         .collect();
 
-    axum::Json(serde_json::json!({
-        "object": "list",
-        "data": models,
-    }))
+    axum::Json(ModelList { object: "list", data })
 }
 
 /// 核心代理逻辑
@@ -213,6 +217,10 @@ async fn proxy_request(
 
                 if status.is_success() {
                     account.report_success(latency_ms);
+
+                    // 从上游响应 header 提取用量百分比并更新到 Account
+                    update_usage_from_headers(&account, &resp_headers);
+
                     account.release();
                     state.scheduler.recompute_health(&account);
                     state.scheduler.notify_available();
@@ -293,6 +301,8 @@ async fn proxy_request(
                 }
 
                 // ── 错误状态码 ──
+                // 错误响应也可能携带用量 header（尤其 429）
+                update_usage_from_headers(&account, &resp_headers);
                 account.release();
                 let error_body = resp.text().await.unwrap_or_default();
                 let duration = request_start.elapsed().as_millis() as i64;
@@ -457,30 +467,24 @@ async fn peek_first_chunk(
                 buf.extend_from_slice(&data);
                 let text = String::from_utf8_lossy(&buf);
 
-                // 检查是否包含错误事件
+                // 检查是否包含完整的 SSE data 行
+                let mut has_data_line = false;
                 for line in text.lines() {
                     if let Some(json_str) = line.strip_prefix("data: ") {
                         if json_str == "[DONE]" {
                             continue;
                         }
-                        if let Ok(event) = serde_json::from_str::<Value>(json_str) {
-                            let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                            if event_type == "response.failed" {
-                                let error_msg = event
-                                    .get("response")
-                                    .and_then(|r| r.get("status_details"))
-                                    .and_then(|d| d.get("error"))
-                                    .and_then(|e| e.get("message"))
-                                    .and_then(|m| m.as_str())
-                                    .unwrap_or("unknown upstream error");
-                                return PeekResult::UpstreamError(error_msg.to_string());
-                            }
+                        has_data_line = true;
+                        if let Some(error_msg) = translator::parse_sse_error(json_str) {
+                            return PeekResult::UpstreamError(error_msg);
                         }
                     }
                 }
 
-                // 有数据且不是错误 → 返回
-                return PeekResult::Data(Bytes::from(buf));
+                // 有完整 data 行且无错误 → 返回；否则继续读取
+                if has_data_line {
+                    return PeekResult::Data(Bytes::from(buf));
+                }
             }
             Err(e) => {
                 return PeekResult::NetworkError(e.to_string());
@@ -890,14 +894,54 @@ fn resolve_session_id(body: &Value, downstream_headers: &HeaderMap, account_id: 
     uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, seed.as_bytes()).to_string()
 }
 
+/// 从上游响应 header 提取用量百分比并更新到 Account
+///
+/// 上游每次响应都会返回：
+/// - `x-codex-primary-window-percent` → 5h 窗口用量百分比
+/// - `x-codex-secondary-window-percent` → 7d 窗口用量百分比
+fn update_usage_from_headers(account: &crate::scheduler::Account, headers: &HeaderMap) {
+    if let Some(primary) = headers
+        .get("x-codex-primary-window-percent")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<f64>().ok())
+    {
+        // 5h 窗口 → usage_5h_pct_100（×100 存储）
+        account
+            .usage_5h_pct_100
+            .store((primary * 100.0) as i64, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(secondary) = headers
+        .get("x-codex-secondary-window-percent")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<f64>().ok())
+    {
+        // 7d 窗口 → usage_7d_pct_100（×100 存储）
+        account
+            .usage_7d_pct_100
+            .store((secondary * 100.0) as i64, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn error_response(status: StatusCode, message: &str) -> Response {
-    let body = serde_json::json!({
-        "error": {
-            "message": message,
-            "type": "proxy_error",
-            "code": status.as_u16(),
-        }
-    });
+    #[derive(Serialize)]
+    struct ErrorResp<'a> {
+        error: ErrorBody<'a>,
+    }
+    #[derive(Serialize)]
+    struct ErrorBody<'a> {
+        message: &'a str,
+        #[serde(rename = "type")]
+        error_type: &'static str,
+        code: u16,
+    }
+
+    let body = ErrorResp {
+        error: ErrorBody {
+            message,
+            error_type: "proxy_error",
+            code: status.as_u16(),
+        },
+    };
     Response::builder()
         .status(status)
         .header("Content-Type", "application/json")

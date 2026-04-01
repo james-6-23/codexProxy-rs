@@ -130,7 +130,7 @@ pub async fn list_accounts(
         let status = if tier == scheduler::TIER_BANNED {
             "error"
         } else if acc.is_in_cooldown() {
-            "cooldown"
+            "rate_limited"
         } else {
             "active"
         };

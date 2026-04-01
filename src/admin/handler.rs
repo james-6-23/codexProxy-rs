@@ -2221,7 +2221,7 @@ pub async fn account_event_trend(
         .unwrap_or(60);
 
     match queries::get_account_event_trend(&state.db(), &start, &end, bucket_minutes).await {
-        Ok(points) => Json(json!({"points": points})).into_response(),
+        Ok(points) => Json(json!({"trend": points})).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),

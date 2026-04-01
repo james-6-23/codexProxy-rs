@@ -135,8 +135,8 @@ pub async fn list_accounts(
             "active"
         };
 
-        let success_requests = (total as f64 * success_rate) as u64;
-        let error_requests = total - success_requests;
+        let error_requests = acc.error_requests.load(Ordering::Relaxed);
+        let success_requests = total.saturating_sub(error_requests);
 
         let resets_at = acc.resets_at.load(Ordering::Relaxed);
 

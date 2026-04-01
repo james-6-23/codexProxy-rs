@@ -46,6 +46,7 @@ pub struct Account {
     // 热路径 — 全部 atomic
     pub active_requests: AtomicI64,
     pub total_requests: AtomicU64,
+    pub error_requests: AtomicU64,
     pub health_tier: AtomicU8,
     /// 评分 × 100 存储为整数（如 8520 = 85.20）
     pub score: AtomicI64,
@@ -134,6 +135,7 @@ impl Account {
             expires_at: RwLock::new(Utc::now()),
             active_requests: AtomicI64::new(0),
             total_requests: AtomicU64::new(0),
+            error_requests: AtomicU64::new(0),
             health_tier: AtomicU8::new(TIER_HEALTHY),
             score: AtomicI64::new(10000), // 100.00
             dynamic_concurrency_limit: AtomicI64::new(2),
@@ -234,6 +236,7 @@ impl Account {
         self.failure_streak.fetch_add(1, Ordering::Relaxed);
         self.success_streak.store(0, Ordering::Relaxed);
         self.total_requests.fetch_add(1, Ordering::Relaxed);
+        self.error_requests.fetch_add(1, Ordering::Relaxed);
 
         match error_type {
             FailureType::Unauthorized => self.last_unauthorized_at.store(now, Ordering::Relaxed),

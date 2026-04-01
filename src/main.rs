@@ -112,8 +112,9 @@ async fn main() {
     // 从数据库恢复请求计数（跨重启保持一致）
     if let Ok(counts) = db::queries::get_account_request_counts(&db_pool).await {
         for acc in scheduler.all_accounts() {
-            if let Some(&(total, _errors)) = counts.get(&acc.db_id) {
+            if let Some(&(total, errors)) = counts.get(&acc.db_id) {
                 acc.total_requests.store(total, std::sync::atomic::Ordering::Relaxed);
+                acc.error_requests.store(errors, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }

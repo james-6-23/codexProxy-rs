@@ -104,6 +104,11 @@ async fn main() {
                 account.resets_at.store(ts, std::sync::atomic::Ordering::Relaxed);
             }
         }
+        if !creds.codex_5h_reset_at.is_empty() {
+            if let Ok(ts) = creds.codex_5h_reset_at.parse::<i64>() {
+                account.resets_5h_at.store(ts, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
 
         // 恢复冷却状态：优先从数据库 cooldown_until 恢复，其次从用量推导
         let now = chrono::Utc::now().timestamp();
@@ -131,8 +136,13 @@ async fn main() {
             let usage_7d = account.usage_7d_pct_100.load(std::sync::atomic::Ordering::Relaxed);
             let usage_5h = account.usage_5h_pct_100.load(std::sync::atomic::Ordering::Relaxed);
             let resets_at = account.resets_at.load(std::sync::atomic::Ordering::Relaxed);
+            let resets_5h = account.resets_5h_at.load(std::sync::atomic::Ordering::Relaxed);
 
-            if usage_7d >= 10000 || usage_5h >= 10000 {
+            if usage_5h >= 10000 && usage_7d < 10000 {
+                // 仅 5h 满 — 用 5h reset 时间
+                let cooldown_until = if resets_5h > now { resets_5h } else if resets_at > now { resets_at } else { now + 5 * 3600 };
+                account.cooldown_until.store(cooldown_until, std::sync::atomic::Ordering::Relaxed);
+            } else if usage_7d >= 10000 {
                 let cooldown_until = if resets_at > now { resets_at } else { now + 7 * 24 * 3600 };
                 account.cooldown_until.store(cooldown_until, std::sync::atomic::Ordering::Relaxed);
             } else if resets_at > now {
@@ -686,12 +696,13 @@ async fn check_usage_reset(state: &AppState) {
     let accounts = state.scheduler.all_accounts();
     let now = chrono::Utc::now().timestamp();
 
-    // 收集到期账号（避免在遍历中持有锁太久）
+    // 收集到期账号：7d 或 5h reset 时间到期
     let due: Vec<_> = accounts
         .iter()
         .filter(|acc| {
-            let ts = acc.resets_at.load(std::sync::atomic::Ordering::Relaxed);
-            ts > 0 && ts <= now
+            let ts_7d = acc.resets_at.load(std::sync::atomic::Ordering::Relaxed);
+            let ts_5h = acc.resets_5h_at.load(std::sync::atomic::Ordering::Relaxed);
+            (ts_7d > 0 && ts_7d <= now) || (ts_5h > 0 && ts_5h <= now)
         })
         .collect();
 
@@ -784,6 +795,7 @@ async fn probe_and_recover(state: &AppState, acc: &Arc<Account>, model: &str) {
 
             // 用量 < 100% — 确认恢复
             acc.resets_at.store(0, std::sync::atomic::Ordering::Relaxed);
+            acc.resets_5h_at.store(0, std::sync::atomic::Ordering::Relaxed);
             acc.usage_7d_pct_100.store(0, std::sync::atomic::Ordering::Relaxed);
             acc.usage_5h_pct_100.store(0, std::sync::atomic::Ordering::Relaxed);
             state.scheduler.try_recover(acc);

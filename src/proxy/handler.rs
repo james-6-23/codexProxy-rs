@@ -1004,23 +1004,46 @@ pub(crate) fn update_usage_from_headers(account: &crate::scheduler::Account, hea
         );
     }
 
-    // 同时从 reset-after-seconds 更新 resets_at（如果当前无探针计划）
-    if account.resets_at.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-        // 取大窗口的 reset 秒数
-        let reset_sec = parse_hdr("x-codex-primary-reset-after-seconds")
-            .zip(primary_win)
-            .and_then(|(sec, win)| if win > 360.0 { Some(sec) } else { None })
-            .or_else(|| {
-                parse_hdr("x-codex-secondary-reset-after-seconds")
-                    .zip(secondary_win)
-                    .and_then(|(sec, win)| if win > 360.0 { Some(sec) } else { None })
-            });
+    // 同时从 reset-after-seconds 更新 resets_at（7d）和 resets_5h_at（5h）
+    let pri_reset = parse_hdr("x-codex-primary-reset-after-seconds");
+    let sec_reset = parse_hdr("x-codex-secondary-reset-after-seconds");
 
-        if let Some(sec) = reset_sec {
-            if sec > 0.0 {
-                let ts = chrono::Utc::now().timestamp() + sec as i64;
-                account.resets_at.store(ts, std::sync::atomic::Ordering::Relaxed);
+    // 归一化：大窗口 → 7d reset，小窗口 → 5h reset
+    let (reset_5h_sec, reset_7d_sec) = match (pri_reset, primary_win, sec_reset, secondary_win) {
+        (Some(p_sec), Some(p_win), Some(s_sec), Some(s_win)) => {
+            if p_win >= s_win {
+                (Some(s_sec), Some(p_sec))
+            } else {
+                (Some(p_sec), Some(s_sec))
             }
+        }
+        (Some(p_sec), p_win, None, _) => {
+            if p_win.unwrap_or(10080.0) > 360.0 {
+                (None, Some(p_sec))
+            } else {
+                (Some(p_sec), None)
+            }
+        }
+        (None, _, Some(s_sec), s_win) => {
+            if s_win.unwrap_or(10080.0) > 360.0 {
+                (None, Some(s_sec))
+            } else {
+                (Some(s_sec), None)
+            }
+        }
+        _ => (None, None),
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    if let Some(sec) = reset_5h_sec {
+        if sec > 0.0 {
+            account.resets_5h_at.store(now + sec as i64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    if let Some(sec) = reset_7d_sec {
+        if sec > 0.0 {
+            let ts = now + sec as i64;
+            account.resets_at.store(ts, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }

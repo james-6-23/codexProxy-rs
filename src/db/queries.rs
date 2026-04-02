@@ -546,7 +546,7 @@ pub async fn clear_usage_logs(pool: &DbPool) -> Result<()> {
 
 // ─── 账号事件 ───
 
-/// 更新账号的用量重置时间（仅更新 credentials JSONB 中的 codex_7d_reset_at 字段）
+/// 更新账号的用量重置时间（7d 和 5h）
 pub async fn update_account_resets_at(pool: &DbPool, id: i64, resets_at: i64) -> Result<()> {
     let ts_str = if resets_at > 0 {
         resets_at.to_string()
@@ -555,6 +555,23 @@ pub async fn update_account_resets_at(pool: &DbPool, id: i64, resets_at: i64) ->
     };
     sqlx::query(
         "UPDATE accounts SET credentials = credentials || jsonb_build_object('codex_7d_reset_at', $1::TEXT), updated_at = NOW() WHERE id = $2",
+    )
+    .bind(&ts_str)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// 更新 5h 窗口用量重置时间
+pub async fn update_account_resets_5h_at(pool: &DbPool, id: i64, resets_5h_at: i64) -> Result<()> {
+    let ts_str = if resets_5h_at > 0 {
+        resets_5h_at.to_string()
+    } else {
+        String::new()
+    };
+    sqlx::query(
+        "UPDATE accounts SET credentials = credentials || jsonb_build_object('codex_5h_reset_at', $1::TEXT), updated_at = NOW() WHERE id = $2",
     )
     .bind(&ts_str)
     .bind(id)

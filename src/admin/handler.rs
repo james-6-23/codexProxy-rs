@@ -139,6 +139,7 @@ pub async fn list_accounts(
         let success_requests = total.saturating_sub(error_requests);
 
         let resets_at = acc.resets_at.load(Ordering::Relaxed);
+        let resets_5h_at = acc.resets_5h_at.load(Ordering::Relaxed);
         let cooldown_until = acc.cooldown_until.load(Ordering::Relaxed);
 
         result.push(json!({
@@ -164,6 +165,7 @@ pub async fn list_accounts(
             "last_rate_limited_at": ts_to_rfc3339(last_429),
             "resets_at": ts_to_rfc3339(resets_at),
             "reset_7d_at": ts_to_rfc3339(resets_at),
+            "reset_5h_at": ts_to_rfc3339(resets_5h_at),
             "cooldown_until": ts_to_rfc3339(cooldown_until),
             "created_at": acc.db_created_at.read().clone(),
             "updated_at": acc.db_updated_at.read().clone(),
@@ -1117,24 +1119,42 @@ async fn batch_test_one(
 
             // 用量 ≥ 100% — 标记为限流，即使 200 也不该继续调度
             if usage_7d >= 10000 || usage_5h >= 10000 {
-                let resets_at_cur = acc.resets_at.load(Ordering::Relaxed);
-                if resets_at_cur > 0 {
-                    let cooldown = (resets_at_cur - chrono::Utc::now().timestamp()).max(60);
+                let now_ts = chrono::Utc::now().timestamp();
+                // 选择合适的 reset 时间：仅 5h 满 → 用 5h reset；7d 满 → 用 7d reset
+                let effective_reset = if usage_5h >= 10000 && usage_7d < 10000 {
+                    // 仅 5h 满 — 优先用 5h reset 时间
+                    let r5 = acc.resets_5h_at.load(Ordering::Relaxed);
+                    if r5 > now_ts { r5 } else { acc.resets_at.load(Ordering::Relaxed) }
+                } else {
+                    acc.resets_at.load(Ordering::Relaxed)
+                };
+
+                if effective_reset > now_ts {
+                    let cooldown = (effective_reset - now_ts).max(60);
                     state.scheduler.mark_cooldown(acc, "rate_limited", cooldown);
-                    // 持久化 resets_at 和冷却状态
                     let db = state.db();
                     let aid = acc.db_id;
-                    let ts = resets_at_cur;
-                    let until = chrono::Utc::now().timestamp() + cooldown;
+                    let until = now_ts + cooldown;
                     tokio::spawn(async move {
-                        let _ = queries::update_account_resets_at(&db, aid, ts).await;
+                        let _ = queries::update_account_cooldown(&db, aid, until, "rate_limited").await;
+                    });
+                } else if acc.resets_at.load(Ordering::Relaxed) > now_ts {
+                    let resets_at_cur = acc.resets_at.load(Ordering::Relaxed);
+                    let cooldown = (resets_at_cur - now_ts).max(60);
+                    state.scheduler.mark_cooldown(acc, "rate_limited", cooldown);
+                    let db = state.db();
+                    let aid = acc.db_id;
+                    let until = now_ts + cooldown;
+                    tokio::spawn(async move {
+                        let _ = queries::update_account_resets_at(&db, aid, resets_at_cur).await;
                         let _ = queries::update_account_cooldown(&db, aid, until, "rate_limited").await;
                     });
                 } else {
-                    // 无 resets_at → 设 7 天冷却并持久化
-                    let fallback_ts = chrono::Utc::now().timestamp() + 7 * 24 * 3600;
+                    // 无有效 reset 时间 → 5h 满用 5h 兜底，7d 满用 7d 兜底
+                    let fallback_secs = if usage_5h >= 10000 && usage_7d < 10000 { 5 * 3600 } else { 7 * 24 * 3600 };
+                    let fallback_ts = now_ts + fallback_secs;
                     acc.resets_at.store(fallback_ts, Ordering::Relaxed);
-                    state.scheduler.mark_cooldown(acc, "rate_limited", 7 * 24 * 3600);
+                    state.scheduler.mark_cooldown(acc, "rate_limited", fallback_secs);
                     let db = state.db();
                     let aid = acc.db_id;
                     tokio::spawn(async move {
@@ -1154,6 +1174,7 @@ async fn batch_test_one(
             // 之前限流且用量已恢复 → 恢复调度
             if (was_cooldown || resets_at > 0) && usage_7d < 10000 && usage_5h < 10000 {
                 acc.resets_at.store(0, Ordering::Relaxed);
+                acc.resets_5h_at.store(0, Ordering::Relaxed);
                 acc.usage_7d_pct_100.store(0, Ordering::Relaxed);
                 acc.usage_5h_pct_100.store(0, Ordering::Relaxed);
                 state.scheduler.try_recover(acc);

@@ -68,7 +68,8 @@ pub struct Account {
     pub usage_5h_pct_100: AtomicI64,
 
     // 上游用量重置时间（unix timestamp，0 = 无计划探针）
-    pub resets_at: AtomicI64,
+    pub resets_at: AtomicI64,      // 7d 窗口重置时间
+    pub resets_5h_at: AtomicI64,   // 5h 窗口重置时间
 
     // 时间戳（unix）
     pub last_success_at: AtomicI64,
@@ -147,6 +148,7 @@ impl Account {
             usage_7d_pct_100: AtomicI64::new(0),
             usage_5h_pct_100: AtomicI64::new(0),
             resets_at: AtomicI64::new(0),
+            resets_5h_at: AtomicI64::new(0),
             last_success_at: AtomicI64::new(0),
             last_failure_at: AtomicI64::new(0),
             last_unauthorized_at: AtomicI64::new(0),

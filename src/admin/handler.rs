@@ -7,7 +7,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 use futures::StreamExt;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::db::models::*;
 use crate::db::queries;
@@ -956,15 +956,33 @@ pub async fn test_connection(
 }
 
 /// POST /api/admin/accounts/batch-test
+/// 可选 body: { "ids": [1, 2, 3] }，为空则测全部
 pub async fn batch_test(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    body: Option<Json<Value>>,
 ) -> impl IntoResponse {
     if let Err(code) = verify_admin(&state, &headers) {
         return (code, Json(json!({"error": "unauthorized"}))).into_response();
     }
 
-    let accounts = state.scheduler.all_accounts();
+    // 解析可选的 ids 过滤
+    let filter_ids: Option<std::collections::HashSet<i64>> = body
+        .and_then(|Json(v)| {
+            v.get("ids")
+                .and_then(|arr| arr.as_array())
+                .filter(|arr| !arr.is_empty())
+                .map(|arr| {
+                    arr.iter().filter_map(|v| v.as_i64()).collect::<std::collections::HashSet<i64>>()
+                })
+        });
+
+    let all_accounts = state.scheduler.all_accounts();
+    let accounts: Vec<_> = if let Some(ref ids) = filter_ids {
+        all_accounts.iter().filter(|a| ids.contains(&a.db_id)).cloned().collect::<Vec<_>>()
+    } else {
+        all_accounts.to_vec()
+    };
     let total = accounts.len();
     if total == 0 {
         return Json(json!({

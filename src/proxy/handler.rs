@@ -856,15 +856,22 @@ pub(crate) fn parse_rate_limit_cooldown(
 
     // 尝试从响应体解析 resets_at
     if let Ok(body) = serde_json::from_str::<Value>(error_body) {
-        // resets_in_seconds
+        // resets_in_seconds（顶层）
         if let Some(secs) = body.get("resets_in_seconds").and_then(|v| v.as_i64()) {
             return secs.max(60);
         }
-        // resets_at ISO 时间
+        // resets_at ISO 时间（顶层）
         if let Some(at) = body.get("resets_at").and_then(|v| v.as_str()) {
             if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(at) {
                 let now = chrono::Utc::now().timestamp();
                 return (dt.timestamp() - now).max(60);
+            }
+        }
+        // /error/resets_at — 整数时间戳（与 429 handler 提取路径一致）
+        if let Some(ts) = body.pointer("/error/resets_at").and_then(|v| v.as_i64()) {
+            let now = chrono::Utc::now().timestamp();
+            if ts > now {
+                return (ts - now).max(60);
             }
         }
     }
@@ -907,7 +914,14 @@ pub(crate) fn parse_rate_limit_cooldown(
         return window_to_cooldown(secondary_window_min);
     }
 
-    // fallback: 按 plan_type
+    // 有用量 header 但均 < 100% — 属于突发/并发限流，短时冷却即可
+    let has_usage_headers = headers.get("x-codex-primary-used-percent").is_some()
+        || headers.get("x-codex-secondary-used-percent").is_some();
+    if has_usage_headers {
+        return 60;
+    }
+
+    // 无任何用量信息的 fallback — 保守处理
     let plan = account.plan_type.read();
     match plan.as_str() {
         "free" => 7 * 24 * 3600,

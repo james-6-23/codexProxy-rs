@@ -163,8 +163,11 @@ export const api = {
   updateSettings: (data: Partial<SystemSettings>) =>
     request<SystemSettings>('/settings', { method: 'PUT', body: JSON.stringify(data) }),
   getModels: () => request<{ models: string[] }>('/models'),
-  batchTestAccounts: () =>
-    request<{ total: number; success: number; failed: number; banned: number; rate_limited: number; recovered: number }>('/accounts/batch-test', { method: 'POST' }),
+  batchTestAccounts: (ids?: number[]) =>
+    request<{ total: number; success: number; failed: number; banned: number; rate_limited: number; recovered: number }>('/accounts/batch-test', {
+      method: 'POST',
+      body: ids && ids.length > 0 ? JSON.stringify({ ids }) : undefined,
+    }),
   batchRefreshAccounts: () =>
     request<{ total: number; refreshed: number; success: number; fail: number; skipped: number }>('/accounts/batch-refresh', { method: 'POST' }),
   cleanBanned: () =>

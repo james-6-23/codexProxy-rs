@@ -529,16 +529,11 @@ export default function Accounts() {
   const handleBatchRefresh = async () => {
     if (selected.size === 0) return
     setBatchLoading(true)
-    let success = 0
-    let fail = 0
-    for (const id of selected) {
-      try {
-        await api.refreshAccount(id)
-        success++
-      } catch {
-        fail++
-      }
-    }
+    const results = await Promise.allSettled(
+      [...selected].map((id) => api.refreshAccount(id))
+    )
+    const success = results.filter((r) => r.status === 'fulfilled').length
+    const fail = results.length - success
     showToast(t('accounts.batchRefreshDone', { success, fail }))
     setBatchLoading(false)
     void reload()
@@ -548,6 +543,25 @@ export default function Accounts() {
     setBatchTesting(true)
     try {
       const result = await api.batchTestAccounts()
+      showToast(t('accounts.batchTestDone', {
+        success: result.success,
+        banned: result.banned,
+        rateLimited: result.rate_limited,
+        failed: result.failed,
+      }))
+      void reload()
+    } catch (error) {
+      showToast(t('accounts.batchTestFailed', { error: getErrorMessage(error) }), 'error')
+    } finally {
+      setBatchTesting(false)
+    }
+  }
+
+  const handleBatchTestSelected = async () => {
+    if (selected.size === 0) return
+    setBatchTesting(true)
+    try {
+      const result = await api.batchTestAccounts([...selected])
       showToast(t('accounts.batchTestDone', {
         success: result.success,
         banned: result.banned,
@@ -781,6 +795,10 @@ export default function Accounts() {
           <div className="flex items-center justify-between gap-3 px-4 py-2.5 mb-4 rounded-2xl bg-primary/10 border border-primary/20 text-sm font-semibold text-primary">
             <span>{t('common.selected', { count: selected.size })}</span>
             <div className="flex items-center gap-1.5">
+              <Button variant="outline" size="sm" disabled={batchLoading || batchTesting} onClick={() => void handleBatchTestSelected()}>
+                <FlaskConical className="size-3" />
+                {batchTesting ? t('accounts.batchTesting') : t('accounts.batchTest')}
+              </Button>
               <Button variant="outline" size="sm" disabled={batchLoading} onClick={() => void handleBatchRefresh()}>
                 {t('accounts.batchRefresh')}
               </Button>

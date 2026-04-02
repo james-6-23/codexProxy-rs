@@ -200,6 +200,15 @@ pub async fn add_account(
         return (code, Json(json!({"error": "unauthorized"}))).into_response();
     }
 
+    // 先查库去重
+    let existing = queries::get_all_refresh_tokens(&state.db()).await.unwrap_or_default();
+    if existing.contains(&req.refresh_token) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({"error": "该 Refresh Token 已存在"})),
+        ).into_response();
+    }
+
     let client = reqwest::Client::new();
     match token::refresh::refresh_with_retry(&client, &req.refresh_token).await {
         Ok(token_resp) => {
@@ -422,11 +431,45 @@ pub async fn batch_import(
         return (code, Json(json!({"error": "unauthorized"}))).into_response();
     }
 
+    // 文件内去重
+    let mut seen = std::collections::HashSet::new();
+    let mut tokens: Vec<String> = Vec::new();
+    for rt in &req.refresh_tokens {
+        let t = rt.trim().to_string();
+        if !t.is_empty() && seen.insert(t.clone()) {
+            tokens.push(t);
+        }
+    }
+
+    if tokens.is_empty() {
+        return Json(json!({"error": "未找到有效的 Refresh Token"})).into_response();
+    }
+
+    // 数据库去重
+    let existing = queries::get_all_refresh_tokens(&state.db()).await.unwrap_or_default();
+    let mut new_tokens: Vec<String> = Vec::new();
+    let mut duplicate_count = 0usize;
+    for rt in &tokens {
+        if existing.contains(rt) {
+            duplicate_count += 1;
+        } else {
+            new_tokens.push(rt.clone());
+        }
+    }
+
+    if new_tokens.is_empty() {
+        return Json(json!({
+            "results": [],
+            "message": format!("所有 {} 个 RT 已存在，无需导入", tokens.len()),
+            "duplicate": duplicate_count,
+        })).into_response();
+    }
+
     let client = reqwest::Client::new();
     let semaphore = Arc::new(tokio::sync::Semaphore::new(10));
     let mut handles = Vec::new();
 
-    for rt in req.refresh_tokens {
+    for rt in new_tokens {
         let client = client.clone();
         let sem = semaphore.clone();
         let state = state.clone();

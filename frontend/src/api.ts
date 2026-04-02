@@ -97,6 +97,8 @@ export const api = {
   getAccounts: () => request<AccountsResponse>('/accounts'),
   addAccount: (data: AddAccountRequest) =>
     request<CreateAccountResponse>('/accounts', { method: 'POST', body: JSON.stringify(data) }),
+  batchImportAccounts: (data: { refresh_tokens: string[]; proxy_url: string }) =>
+    request<{ results: Array<{ status: string; email?: string; error?: string }> }>('/accounts/batch', { method: 'POST', body: JSON.stringify(data) }),
   addATAccount: (data: AddATAccountRequest) =>
     request<CreateAccountResponse>('/accounts/at', { method: 'POST', body: JSON.stringify(data) }),
   deleteAccount: (id: number) =>

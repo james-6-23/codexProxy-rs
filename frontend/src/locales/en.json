@@ -246,6 +246,7 @@
     "selectTxtFile": "Please select a .txt file",
     "addSuccess": "Account added successfully",
     "addFailed": "Failed to add account: {{error}}",
+    "batchImportDone": "Batch import done: {{success}} succeeded, {{fail}} failed, {{duplicate}} duplicate",
     "importFailed": "Import failed",
     "importFailedWithReason": "Import failed: {{error}}",
     "importCompleted": "Import completed",

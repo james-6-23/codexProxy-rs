@@ -190,8 +190,22 @@ export default function Accounts() {
     if (!addForm.refresh_token.trim()) return
     setSubmitting(true)
     try {
-      await api.addAccount(addForm)
-      showToast(t('accounts.addSuccess'))
+      // 按行分割，过滤空行
+      const lines = addForm.refresh_token.split('\n').map(l => l.trim()).filter(Boolean)
+      if (lines.length === 0) return
+
+      if (lines.length === 1) {
+        // 单条 → 走单条接口
+        await api.addAccount({ refresh_token: lines[0], proxy_url: addForm.proxy_url })
+        showToast(t('accounts.addSuccess'))
+      } else {
+        // 多条 → 走批量接口，每条独立，一个失败不影响其他
+        const result = await api.batchImportAccounts({ refresh_tokens: lines, proxy_url: addForm.proxy_url })
+        const ok = result.results.filter(r => r.status === 'ok').length
+        const fail = result.results.filter(r => r.status === 'error').length
+        const dup = result.results.length === 0 && ok === 0 ? lines.length : 0
+        showToast(t('accounts.batchImportDone', { success: ok, fail, duplicate: dup }))
+      }
       setShowAdd(false)
       setAddForm({ refresh_token: '', proxy_url: '' })
       void reload()

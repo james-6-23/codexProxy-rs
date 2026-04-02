@@ -246,6 +246,7 @@
     "selectTxtFile": "请选择 .txt 文件",
     "addSuccess": "账号添加成功",
     "addFailed": "添加失败：{{error}}",
+    "batchImportDone": "批量导入完成：成功 {{success}} / 失败 {{fail}} / 重复 {{duplicate}}",
     "importFailed": "导入失败",
     "importFailedWithReason": "导入失败：{{error}}",
     "importCompleted": "导入完成",

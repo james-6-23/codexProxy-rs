@@ -1430,6 +1430,10 @@ pub async fn ops_overview(
     let tpm = usage.as_ref().map(|u| u.tpm as f64).unwrap_or(0.0);
     let error_rate = usage.as_ref().map(|u| u.error_rate).unwrap_or(0.0);
 
+    let qps = rpm / 60.0;
+    let tps = tpm / 60.0;
+    let (qps_peak, tps_peak) = state.update_peaks(qps, tps);
+
     // CPU & 内存
     let (cpu_percent, mem_percent, mem_used, mem_total, process_mem) = get_sys_metrics();
 
@@ -1481,8 +1485,8 @@ pub async fn ops_overview(
             "pool_size": cache_size, "usage_percent": 0.0,
         },
         "traffic": {
-            "qps": rpm / 60.0, "qps_peak": 0.0,
-            "tps": tpm / 60.0, "tps_peak": 0.0,
+            "qps": qps, "qps_peak": qps_peak,
+            "tps": tps, "tps_peak": tps_peak,
             "rpm": rpm, "tpm": tpm,
             "error_rate": error_rate,
             "today_requests": today_requests,

@@ -1830,9 +1830,9 @@ pub async fn import_accounts(
 
     let mut format = "txt".to_string();
     let mut proxy_url = String::new();
-    let mut file_data: Vec<u8> = Vec::new();
+    let mut file_datas: Vec<Vec<u8>> = Vec::new();
 
-    // 解析 multipart 字段
+    // 解析 multipart 字段（支持多个 file 字段）
     while let Ok(Some(field)) = multipart.next_field().await {
         let name = field.name().unwrap_or("").to_string();
         match name.as_str() {
@@ -1843,13 +1843,16 @@ pub async fn import_accounts(
                 proxy_url = field.text().await.unwrap_or_default();
             }
             "file" => {
-                file_data = field.bytes().await.unwrap_or_default().to_vec();
+                let data = field.bytes().await.unwrap_or_default().to_vec();
+                if !data.is_empty() {
+                    file_datas.push(data);
+                }
             }
             _ => {}
         }
     }
 
-    if file_data.is_empty() {
+    if file_datas.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "请上传文件（字段名: file）"})).to_string(),
@@ -1857,18 +1860,30 @@ pub async fn import_accounts(
             .into_response();
     }
 
-    if file_data.len() > 2 * 1024 * 1024 {
+    let total_size: usize = file_datas.iter().map(|d| d.len()).sum();
+    if total_size > 2 * 1024 * 1024 {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "文件大小不能超过 2MB"})).to_string(),
+            Json(json!({"error": "文件总大小不能超过 2MB"})).to_string(),
         )
             .into_response();
     }
 
     match format.as_str() {
-        "at_txt" => import_at_txt(state, file_data, proxy_url).await,
-        "json" => import_json(state, file_data, proxy_url).await,
-        _ => import_rt_txt(state, file_data, proxy_url).await,
+        "json" => import_json(state, file_datas, proxy_url).await,
+        // txt 格式：合并所有文件内容（用换行拼接）
+        _ => {
+            let merged: Vec<u8> = file_datas.into_iter().enumerate().fold(Vec::new(), |mut acc, (i, d)| {
+                if i > 0 { acc.push(b'\n'); }
+                acc.extend(d);
+                acc
+            });
+            if format == "at_txt" {
+                import_at_txt(state, merged, proxy_url).await
+            } else {
+                import_rt_txt(state, merged, proxy_url).await
+            }
+        }
     }
 }
 
@@ -2197,15 +2212,12 @@ async fn import_rt_txt(
         .unwrap()
 }
 
-/// JSON 文件导入
+/// JSON 文件导入（支持多文件批量）
 async fn import_json(
     state: Arc<AppState>,
-    file_data: Vec<u8>,
+    file_datas: Vec<Vec<u8>>,
     proxy_url: String,
 ) -> axum::response::Response {
-    let content = String::from_utf8_lossy(&file_data);
-    let content = content.trim_start_matches('\u{feff}');
-
     #[derive(Deserialize)]
     struct JsonEntry {
         #[serde(default)]
@@ -2216,19 +2228,31 @@ async fn import_json(
         email: String,
     }
 
-    let entries: Vec<JsonEntry> = if let Ok(arr) = serde_json::from_str::<Vec<JsonEntry>>(content) {
-        arr
-    } else if let Ok(single) = serde_json::from_str::<JsonEntry>(content) {
-        vec![single]
-    } else {
+    let mut all_entries: Vec<JsonEntry> = Vec::new();
+
+    for file_data in &file_datas {
+        let content = String::from_utf8_lossy(file_data);
+        let content = content.trim_start_matches('\u{feff}');
+
+        if let Ok(arr) = serde_json::from_str::<Vec<JsonEntry>>(content) {
+            all_entries.extend(arr);
+        } else if let Ok(single) = serde_json::from_str::<JsonEntry>(content) {
+            all_entries.push(single);
+        } else {
+            // 跳过无法解析的文件，继续处理其他文件
+            continue;
+        }
+    }
+
+    if all_entries.is_empty() {
         return Json(json!({"error": "不是有效的 JSON 格式"})).into_response();
-    };
+    }
 
     // 按 token 类型分流：有 refresh_token 走 RT 导入，否则有 access_token 走 AT 导入
     let mut rt_tokens: Vec<String> = Vec::new();
     let mut at_tokens: Vec<String> = Vec::new();
 
-    for e in entries {
+    for e in all_entries {
         let rt = e.refresh_token.trim().to_string();
         let at = e.access_token.trim().to_string();
         if !rt.is_empty() {

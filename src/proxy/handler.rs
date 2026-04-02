@@ -357,6 +357,11 @@ async fn proxy_request(
                             state.scheduler.remove_account(account.db_id);
                         } else {
                             state.scheduler.mark_banned(&account);
+                            let db = state.db();
+                            let aid = account.db_id;
+                            tokio::spawn(async move {
+                                let _ = crate::db::queries::update_account_cooldown(&db, aid, chrono::Utc::now().timestamp() + 6 * 3600, "banned_401").await;
+                            });
                             warn!(account_id = account.db_id, "账号 401 banned");
                         }
                         exclude_set.insert(account.db_id);
@@ -396,6 +401,12 @@ async fn proxy_request(
                             state
                                 .scheduler
                                 .mark_cooldown(&account, "rate_limited", cooldown);
+                            let db = state.db();
+                            let aid = account.db_id;
+                            let until = chrono::Utc::now().timestamp() + cooldown;
+                            tokio::spawn(async move {
+                                let _ = crate::db::queries::update_account_cooldown(&db, aid, until, "rate_limited").await;
+                            });
                             warn!(account_id = account.db_id, cooldown, "账号 429");
                         }
                         exclude_set.insert(account.db_id);

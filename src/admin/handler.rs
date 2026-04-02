@@ -139,6 +139,7 @@ pub async fn list_accounts(
         let success_requests = total.saturating_sub(error_requests);
 
         let resets_at = acc.resets_at.load(Ordering::Relaxed);
+        let cooldown_until = acc.cooldown_until.load(Ordering::Relaxed);
 
         result.push(json!({
             "id": acc.db_id,
@@ -163,6 +164,7 @@ pub async fn list_accounts(
             "last_rate_limited_at": ts_to_rfc3339(last_429),
             "resets_at": ts_to_rfc3339(resets_at),
             "reset_7d_at": ts_to_rfc3339(resets_at),
+            "cooldown_until": ts_to_rfc3339(cooldown_until),
             "created_at": acc.db_created_at.read().clone(),
             "updated_at": acc.db_updated_at.read().clone(),
         }));
@@ -632,7 +634,7 @@ pub async fn refresh_account(
                 *account.plan_type.write() = info.chatgpt_plan_type;
             }
 
-            state.scheduler.clear_cooldown(&account);
+            // 仅刷新凭证，不清除冷却状态（限流账号刷新 token 后仍限流，需等探针确认恢复）
 
             Json(json!({"message": "ok"})).into_response()
         }
@@ -1119,12 +1121,14 @@ async fn batch_test_one(
                 if resets_at_cur > 0 {
                     let cooldown = (resets_at_cur - chrono::Utc::now().timestamp()).max(60);
                     state.scheduler.mark_cooldown(acc, "rate_limited", cooldown);
-                    // 持久化 resets_at（可能来自 header 的 reset-after-seconds）
+                    // 持久化 resets_at 和冷却状态
                     let db = state.db();
                     let aid = acc.db_id;
                     let ts = resets_at_cur;
+                    let until = chrono::Utc::now().timestamp() + cooldown;
                     tokio::spawn(async move {
                         let _ = queries::update_account_resets_at(&db, aid, ts).await;
+                        let _ = queries::update_account_cooldown(&db, aid, until, "rate_limited").await;
                     });
                 } else {
                     // 无 resets_at → 设 7 天冷却并持久化
@@ -1135,6 +1139,7 @@ async fn batch_test_one(
                     let aid = acc.db_id;
                     tokio::spawn(async move {
                         let _ = queries::update_account_resets_at(&db, aid, fallback_ts).await;
+                        let _ = queries::update_account_cooldown(&db, aid, fallback_ts, "rate_limited").await;
                     });
                 }
 
@@ -1196,6 +1201,14 @@ async fn batch_test_one(
                 &resp_headers, &body, acc,
             );
             state.scheduler.mark_cooldown(acc, "rate_limited", cooldown);
+            {
+                let db = state.db();
+                let aid = acc.db_id;
+                let until = chrono::Utc::now().timestamp() + cooldown;
+                tokio::spawn(async move {
+                    let _ = queries::update_account_cooldown(&db, aid, until, "rate_limited").await;
+                });
+            }
 
             warn!(
                 account_id = acc.db_id, email = %email, cooldown,
@@ -1206,6 +1219,14 @@ async fn batch_test_one(
         401 => {
             acc.report_failure(scheduler::FailureType::Unauthorized);
             state.scheduler.mark_banned(acc);
+            {
+                let db = state.db();
+                let aid = acc.db_id;
+                let until = chrono::Utc::now().timestamp() + 6 * 3600;
+                tokio::spawn(async move {
+                    let _ = queries::update_account_cooldown(&db, aid, until, "banned_401").await;
+                });
+            }
 
             warn!(account_id = acc.db_id, email = %email, "批量测试 401");
             BatchTestResult::Banned

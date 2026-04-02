@@ -32,7 +32,7 @@ pub async fn list_active_accounts(pool: &DbPool) -> Result<Vec<AccountRow>> {
     let rows = sqlx::query_as::<_, AccountRow>(
         "SELECT id, name, platform, type, credentials::TEXT, proxy_url, status,
                 error_message, cooldown_reason,
-                cooldown_until::TEXT,
+                TO_CHAR(cooldown_until AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS cooldown_until,
                 TO_CHAR(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at,
                 TO_CHAR(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at
          FROM accounts WHERE status = 'active' ORDER BY id",
@@ -579,7 +579,31 @@ pub async fn persist_account_usage(pool: &DbPool, id: i64, usage_7d: f64, usage_
 /// 清除账号用量状态（探针恢复后调用）
 pub async fn clear_account_usage_state(pool: &DbPool, id: i64) -> Result<()> {
     sqlx::query(
-        "UPDATE accounts SET credentials = credentials || '{\"codex_7d_used_percent\": 0, \"codex_5h_used_percent\": 0, \"codex_7d_reset_at\": \"\", \"codex_5h_reset_at\": \"\"}'::JSONB, updated_at = NOW() WHERE id = $1",
+        "UPDATE accounts SET credentials = credentials || '{\"codex_7d_used_percent\": 0, \"codex_5h_used_percent\": 0, \"codex_7d_reset_at\": \"\", \"codex_5h_reset_at\": \"\"}'::JSONB, cooldown_until = NULL, cooldown_reason = '', updated_at = NOW() WHERE id = $1",
+    )
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// 持久化冷却状态到数据库
+pub async fn update_account_cooldown(pool: &DbPool, id: i64, until_ts: i64, reason: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE accounts SET cooldown_until = TO_TIMESTAMP($1::FLOAT8), cooldown_reason = $2, updated_at = NOW() WHERE id = $3",
+    )
+    .bind(until_ts as f64)
+    .bind(reason)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// 清除数据库中的冷却状态
+pub async fn clear_account_cooldown(pool: &DbPool, id: i64) -> Result<()> {
+    sqlx::query(
+        "UPDATE accounts SET cooldown_until = NULL, cooldown_reason = '', updated_at = NOW() WHERE id = $1",
     )
     .bind(id)
     .execute(pool)

@@ -105,19 +105,39 @@ async fn main() {
             }
         }
 
-        // 恢复冷却状态：用量 ≥ 100% 或 resets_at 未到期 → 标记冷却
-        let usage_7d = account.usage_7d_pct_100.load(std::sync::atomic::Ordering::Relaxed);
-        let usage_5h = account.usage_5h_pct_100.load(std::sync::atomic::Ordering::Relaxed);
-        let resets_at = account.resets_at.load(std::sync::atomic::Ordering::Relaxed);
+        // 恢复冷却状态：优先从数据库 cooldown_until 恢复，其次从用量推导
         let now = chrono::Utc::now().timestamp();
+        let mut restored_cooldown = false;
 
-        if usage_7d >= 10000 || usage_5h >= 10000 {
-            // 用量满 → 冷却到 resets_at，无 resets_at 则 7 天
-            let cooldown_until = if resets_at > now { resets_at } else { now + 7 * 24 * 3600 };
-            account.cooldown_until.store(cooldown_until, std::sync::atomic::Ordering::Relaxed);
-        } else if resets_at > now {
-            // 有未到期的重置时间 → 冷却到 resets_at
-            account.cooldown_until.store(resets_at, std::sync::atomic::Ordering::Relaxed);
+        // 1) 从数据库持久化的 cooldown_until 恢复
+        if let Some(ref cd_str) = row.cooldown_until {
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(cd_str) {
+                let ts = dt.timestamp();
+                if ts > now {
+                    account.cooldown_until.store(ts, std::sync::atomic::Ordering::Relaxed);
+                    restored_cooldown = true;
+                }
+            }
+            // 如果 cooldown_reason 是 banned_401，恢复 banned 状态
+            if restored_cooldown && row.cooldown_reason == "banned_401" {
+                account.last_unauthorized_at.store(now - 1, std::sync::atomic::Ordering::Relaxed);
+                account.health_tier.store(scheduler::TIER_BANNED, std::sync::atomic::Ordering::Relaxed);
+                account.dynamic_concurrency_limit.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        // 2) 兜底：从用量数据推导冷却（数据库无 cooldown_until 但用量满的情况）
+        if !restored_cooldown {
+            let usage_7d = account.usage_7d_pct_100.load(std::sync::atomic::Ordering::Relaxed);
+            let usage_5h = account.usage_5h_pct_100.load(std::sync::atomic::Ordering::Relaxed);
+            let resets_at = account.resets_at.load(std::sync::atomic::Ordering::Relaxed);
+
+            if usage_7d >= 10000 || usage_5h >= 10000 {
+                let cooldown_until = if resets_at > now { resets_at } else { now + 7 * 24 * 3600 };
+                account.cooldown_until.store(cooldown_until, std::sync::atomic::Ordering::Relaxed);
+            } else if resets_at > now {
+                account.cooldown_until.store(resets_at, std::sync::atomic::Ordering::Relaxed);
+            }
         }
 
         scheduler.add_account(account);
@@ -530,6 +550,11 @@ async fn probe_recovery(state: &AppState, client: &reqwest::Client) {
                 *acc.expires_at.write() = new_expires;
 
                 state.scheduler.try_recover(acc);
+                let db = state.db();
+                let aid = acc.db_id;
+                tokio::spawn(async move {
+                    let _ = db::queries::clear_account_cooldown(&db, aid).await;
+                });
                 info!(account_id = acc.db_id, "Banned 账号恢复成功");
             }
             Err(_) => {}
@@ -798,8 +823,10 @@ async fn probe_and_recover(state: &AppState, acc: &Arc<Account>, model: &str) {
             state.scheduler.mark_banned(acc);
             let db = state.db();
             let aid = acc.db_id;
+            let until = chrono::Utc::now().timestamp() + 6 * 3600;
             tokio::spawn(async move {
                 let _ = db::queries::update_account_resets_at(&db, aid, 0).await;
+                let _ = db::queries::update_account_cooldown(&db, aid, until, "banned_401").await;
             });
             warn!(account_id = acc.db_id, "重置探针 401 — 标记 banned");
         }

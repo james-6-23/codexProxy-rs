@@ -187,7 +187,7 @@ pub async fn query_chart_data(pool: &DbPool, range_minutes: i64, bucket_minutes:
     let timeline = sqlx::query_as::<_, ChartBucket>(
         "SELECT
             TO_CHAR(
-                TO_TIMESTAMP(FLOOR(EXTRACT(EPOCH FROM created_at) / $1) * $1),
+                TO_TIMESTAMP(FLOOR(EXTRACT(EPOCH FROM created_at) / $1) * $1) AT TIME ZONE 'Asia/Shanghai',
                 'YYYY-MM-DD\"T\"HH24:MI:SS'
             ) AS bucket,
             COUNT(*)::BIGINT AS requests,
@@ -634,7 +634,7 @@ pub async fn get_account_event_trend(
     let rows = sqlx::query_as::<_, AccountEventPoint>(
         "SELECT
             TO_CHAR(
-                TO_TIMESTAMP(FLOOR(EXTRACT(EPOCH FROM created_at) / $1) * $1),
+                TO_TIMESTAMP(FLOOR(EXTRACT(EPOCH FROM created_at) / $1) * $1) AT TIME ZONE 'Asia/Shanghai',
                 'YYYY-MM-DD\"T\"HH24:MI:SS'
             ) AS bucket,
             COALESCE(SUM(CASE WHEN event_type = 'added' THEN 1 ELSE 0 END), 0)::BIGINT AS added,

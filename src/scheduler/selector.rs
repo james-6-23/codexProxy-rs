@@ -2,12 +2,12 @@ use super::*;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::scheduler::scorer::Scorer;
 
 impl Scheduler {
-    /// 核心选择算法：O(1) 分桶 round-robin + fallback 全扫描
+    /// 核心选择算法：Session Affinity + O(1) 分桶 round-robin + fallback 全扫描
     ///
     /// 返回 (账号引用, 已自动 acquire)
     pub fn next_account(&self, exclude: &HashSet<i64>) -> Option<Arc<Account>> {
@@ -17,6 +17,47 @@ impl Scheduler {
         }
         // fallback: 全量扫描（处理桶可能过期的情况）
         self.select_full_scan(exclude)
+    }
+
+    /// 带 Session Affinity 的账号选择
+    pub fn next_account_with_session(
+        &self,
+        session_id: &str,
+        exclude: &HashSet<i64>,
+    ) -> Option<Arc<Account>> {
+        // 1. 尝试复用已绑定的账号
+        if !session_id.is_empty() {
+            if let Some(entry) = self.session_affinity.get(session_id) {
+                let (account_id, _) = *entry;
+                drop(entry); // 释放读锁
+
+                if !exclude.contains(&account_id) {
+                    if let Some(acc) = self.get_account(account_id) {
+                        if acc.is_available() && acc.try_acquire() {
+                            // 更新最后使用时间
+                            self.session_affinity.insert(
+                                session_id.to_string(),
+                                (account_id, Instant::now())
+                            );
+                            return Some(acc);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. 没有绑定或绑定账号不可用，选择新账号
+        let account = self.next_account(exclude)?;
+
+        // 3. 建立 session 绑定
+        if !session_id.is_empty() {
+            self.session_affinity.insert(
+                session_id.to_string(),
+                (account.db_id, Instant::now())
+            );
+        }
+
+        Some(account)
     }
 
     /// 等待可用账号（带超时）
@@ -38,6 +79,30 @@ impl Scheduler {
             _ = tokio::time::sleep(timeout) => {
                 // 超时前最后尝试一次
                 self.next_account(exclude)
+            }
+        }
+    }
+
+    /// 带 Session Affinity 的等待
+    pub async fn wait_for_available_with_session(
+        &self,
+        session_id: &str,
+        exclude: &HashSet<i64>,
+        timeout: Duration,
+    ) -> Option<Arc<Account>> {
+        // 先尝试立即获取
+        if let Some(acc) = self.next_account_with_session(session_id, exclude) {
+            return Some(acc);
+        }
+
+        // 等待通知或超时
+        tokio::select! {
+            _ = self.available_notify.notified() => {
+                self.next_account_with_session(session_id, exclude)
+            }
+            _ = tokio::time::sleep(timeout) => {
+                // 超时前最后尝试一次
+                self.next_account_with_session(session_id, exclude)
             }
         }
     }
@@ -88,7 +153,9 @@ impl Scheduler {
         None
     }
 
-    /// 全量扫描 — 按 score 降序选择最佳可用账号
+    /// 全量扫描 — 按 dispatch_score 降序选择最佳可用账号
+    ///
+    /// dispatch_score = 基础分 + 7d 紧迫度奖励，使 7d 即将重置的账号在全扫描时优先入选
     fn select_full_scan(&self, exclude: &HashSet<i64>) -> Option<Arc<Account>> {
         let accounts = self.accounts.read();
         let now = chrono::Utc::now().timestamp();
@@ -104,8 +171,8 @@ impl Scheduler {
                 continue;
             }
 
-            // 实时计算分数
-            let score = Scorer::compute(acc, now);
+            // 实时计算调度分（含紧迫度奖励）
+            let score = Scorer::dispatch_score(acc, now);
 
             // 加入负载因子：当前活跃请求越少越好
             let load_penalty = acc.active_requests.load(Ordering::Relaxed) * 500;

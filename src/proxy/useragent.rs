@@ -1,24 +1,29 @@
+use crate::config::AppConfig;
+
 /// 版本号 + 权重（正式版权重高，alpha 权重低）
 ///
+/// 与 Go 版 `latestCodexCLIVersion = 0.128.0` 对齐——把 0.128.0 作为主版本，
+/// 同时保留少量较旧的正式版与 alpha 版以模拟真实用户分布（多版本混用更不易被识别）。
+///
 /// 权重含义：该版本在 UA 池中出现的条目数
-/// 正式版 0.117.0: 权重 5（最新正式版，用户最多）
-/// 正式版 0.116.0: 权重 3
-/// 正式版 0.115.0: 权重 2
-/// Alpha  0.118.x: 权重 1（尝鲜用户少）
-/// Alpha  0.117.x: 权重 1
-/// Alpha  0.116.x: 权重 1
+/// 正式版 0.128.0: 权重 5（最新正式版，与 Go 对齐）
+/// 正式版 0.127.0: 权重 3
+/// 正式版 0.126.0: 权重 2
+/// Alpha  0.129.0-alpha.4: 权重 1（尝鲜用户少）
+/// Alpha  0.128.0-alpha.12: 权重 1
+/// Alpha  0.127.0-alpha.20: 权重 1
 struct VersionWeight {
     version: &'static str,
     weight: usize,
 }
 
 static VERSIONS: &[VersionWeight] = &[
-    VersionWeight { version: "0.117.0", weight: 5 },
-    VersionWeight { version: "0.116.0", weight: 3 },
-    VersionWeight { version: "0.115.0", weight: 2 },
-    VersionWeight { version: "0.118.0-alpha.3", weight: 1 },
-    VersionWeight { version: "0.117.0-alpha.25", weight: 1 },
-    VersionWeight { version: "0.116.0-alpha.12", weight: 1 },
+    VersionWeight { version: "0.128.0", weight: 5 },
+    VersionWeight { version: "0.127.0", weight: 3 },
+    VersionWeight { version: "0.126.0", weight: 2 },
+    VersionWeight { version: "0.129.0-alpha.4", weight: 1 },
+    VersionWeight { version: "0.128.0-alpha.12", weight: 1 },
+    VersionWeight { version: "0.127.0-alpha.20", weight: 1 },
 ];
 
 /// 平台 + 终端组合模板（{V} 占位符替换为版本号）
@@ -60,6 +65,48 @@ static UA_POOL: LazyLock<Vec<String>> = LazyLock::new(|| {
     pool
 });
 
+/// 设备指纹配置（运行时可覆盖）
+pub struct DeviceProfile {
+    pub user_agent: String,
+    pub package_version: String,
+    pub runtime_version: String,
+    pub os: String,
+    pub arch: String,
+}
+
+impl DeviceProfile {
+    /// 从配置和账号 ID 生成设备指纹
+    pub fn from_config(config: &AppConfig, account_id: &str) -> Self {
+        // 如果配置了固定 UA，直接使用（stabilize_device_profile = true）
+        if config.stabilize_device_profile {
+            if let Some(ref ua) = config.device_user_agent {
+                let version = version_from_ua(ua);
+                let (os, arch) = platform_from_ua(ua);
+                return Self {
+                    user_agent: ua.clone(),
+                    package_version: config.device_package_version.clone().unwrap_or_else(|| version.to_string()),
+                    runtime_version: config.device_runtime_version.clone().unwrap_or_else(|| version.to_string()),
+                    os: config.device_os.clone().unwrap_or_else(|| os.to_string()),
+                    arch: config.device_arch.clone().unwrap_or_else(|| arch.to_string()),
+                };
+            }
+        }
+
+        // 否则按账号 ID 确定性选择
+        let ua = ua_for_account(account_id);
+        let version = version_from_ua(ua);
+        let (os, arch) = platform_from_ua(ua);
+
+        Self {
+            user_agent: ua.to_string(),
+            package_version: config.device_package_version.clone().unwrap_or_else(|| version.to_string()),
+            runtime_version: config.device_runtime_version.clone().unwrap_or_else(|| version.to_string()),
+            os: config.device_os.clone().unwrap_or_else(|| os.to_string()),
+            arch: config.device_arch.clone().unwrap_or_else(|| arch.to_string()),
+        }
+    }
+}
+
 /// 按账号 ID 确定性选择 UA（同一账号始终相同 UA）
 pub fn ua_for_account(account_id: &str) -> &str {
     let pool = &*UA_POOL;
@@ -69,7 +116,7 @@ pub fn ua_for_account(account_id: &str) -> &str {
     &pool[idx]
 }
 
-/// 从 UA 中提取版本号（如 "0.117.0"）
+/// 从 UA 中提取版本号（如 "0.128.0"）
 pub fn version_from_ua(ua: &str) -> &str {
     // 格式: codex_cli_rs/X.Y.Z[-alpha.N] (...)
     if let Some(start) = ua.find('/') {
@@ -82,7 +129,7 @@ pub fn version_from_ua(ua: &str) -> &str {
 
 /// 从 UA 中提取平台 OS 和 Arch（与 X-Stainless-Os / X-Stainless-Arch 保持一致）
 ///
-/// UA 格式: `codex_cli_rs/0.117.0 (Mac OS 15.5.0; arm64) ...`
+/// UA 格式: `codex_cli_rs/0.128.0 (Mac OS 15.5.0; arm64) ...`
 /// 返回 `("MacOS", "arm64")` / `("Linux", "x86_64")` / `("Windows", "x86_64")`
 pub fn platform_from_ua(ua: &str) -> (&str, &str) {
     // 提取括号内的平台描述
@@ -118,6 +165,56 @@ fn fnv32a(data: &[u8]) -> u32 {
     hash
 }
 
+// ─── 官方客户端识别 ───
+//
+// 与 Go 版 `IsCodexOfficialClientByHeaders` 对齐——识别下游请求的 User-Agent /
+// Originator 是否来自官方 / 受信任的 Codex 客户端家族（codex_cli_rs / codex_vscode /
+// codex_app / codex_chatgpt_desktop / codex_atlas / codex_exec / codex_sdk_ts / codex /
+// opencode）。命中后上游可放行额外能力（如 reasoning_effort=xhigh），并允许
+// 透传下游 UA / Originator 而不是覆盖成兜底值。
+
+/// 官方 Codex 客户端 UA 前缀（含部分受信任第三方）
+const OFFICIAL_UA_PREFIXES: &[&str] = &[
+    "codex_cli_rs/",
+    "codex_vscode/",
+    "codex_app/",
+    "codex_chatgpt_desktop/",
+    "codex_atlas/",
+    "codex_exec/",
+    "codex_sdk_ts/",
+    "codex ",
+    "opencode/",
+];
+
+/// 官方 Codex Originator 前缀（ChatGPT 后端接受的一等公民）
+const OFFICIAL_ORIGINATOR_PREFIXES: &[&str] = &["codex_", "codex ", "opencode"];
+
+/// 判断下游 UA / Originator 是否来自官方 / 受信任的 Codex 客户端
+///
+/// 与 Go `IsCodexOfficialClientByHeaders` 行为一致：两个值都做 lower+trim，
+/// 任一前缀命中（prefix 或 contains）即视为官方。
+pub fn is_codex_official_client_by_headers(user_agent: &str, originator: &str) -> bool {
+    match_codex_prefixes(user_agent, OFFICIAL_UA_PREFIXES)
+        || match_codex_prefixes(originator, OFFICIAL_ORIGINATOR_PREFIXES)
+}
+
+fn match_codex_prefixes(value: &str, prefixes: &[&str]) -> bool {
+    let v = value.trim().to_ascii_lowercase();
+    if v.is_empty() {
+        return false;
+    }
+    for prefix in prefixes {
+        let p = prefix.trim().to_ascii_lowercase();
+        if p.is_empty() {
+            continue;
+        }
+        if v.starts_with(&p) || v.contains(&p) {
+            return true;
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,10 +225,10 @@ mod tests {
         // 总量 = (5+3+2+1+1+1) × 16 模板 = 13 × 16 = 208
         assert_eq!(pool.len(), 13 * TEMPLATES.len());
 
-        // 正式版 0.117.0 占比最高
-        let v117_count = pool.iter().filter(|ua| ua.contains("/0.117.0 ")).count();
+        // 最新正式版 0.128.0 占比最高
+        let v_latest_count = pool.iter().filter(|ua| ua.contains("/0.128.0 ")).count();
         let alpha_count = pool.iter().filter(|ua| ua.contains("alpha")).count();
-        assert!(v117_count > alpha_count, "正式版应多于 alpha");
+        assert!(v_latest_count > alpha_count, "正式版应多于 alpha");
     }
 
     #[test]
@@ -145,12 +242,32 @@ mod tests {
     #[test]
     fn test_version_extraction() {
         assert_eq!(
-            version_from_ua("codex_cli_rs/0.117.0 (Mac OS 15.5.0; arm64) Apple_Terminal/464"),
-            "0.117.0"
+            version_from_ua("codex_cli_rs/0.128.0 (Mac OS 15.5.0; arm64) Apple_Terminal/464"),
+            "0.128.0"
         );
         assert_eq!(
-            version_from_ua("codex_cli_rs/0.118.0-alpha.3 (Ubuntu 24.04; x86_64) kitty/0.35.2"),
-            "0.118.0-alpha.3"
+            version_from_ua("codex_cli_rs/0.129.0-alpha.4 (Ubuntu 24.04; x86_64) kitty/0.35.2"),
+            "0.129.0-alpha.4"
         );
+    }
+
+    #[test]
+    fn test_is_codex_official_client_by_headers() {
+        // 通过 UA 命中
+        assert!(is_codex_official_client_by_headers(
+            "codex_cli_rs/0.128.0 (Mac OS 15.5.0; arm64) Apple_Terminal/464",
+            "",
+        ));
+        // 通过 Originator 命中
+        assert!(is_codex_official_client_by_headers("", "codex_cli_rs"));
+        assert!(is_codex_official_client_by_headers("", "opencode"));
+        // 第三方 SDK
+        assert!(is_codex_official_client_by_headers(
+            "codex_vscode/1.2.3", ""
+        ));
+        // 未命中
+        assert!(!is_codex_official_client_by_headers("", ""));
+        assert!(!is_codex_official_client_by_headers("curl/8.0", ""));
+        assert!(!is_codex_official_client_by_headers("", "random-tool"));
     }
 }

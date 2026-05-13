@@ -648,6 +648,59 @@ pub async fn refresh_account(
     }
 }
 
+/// POST /api/admin/accounts/{id}/enable — 切换账号调度启用状态
+pub async fn toggle_account_enabled(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(req): Json<Value>,
+) -> impl IntoResponse {
+    if let Err(code) = verify_admin(&state, &headers) {
+        return (code, Json(json!({"error": "unauthorized"}))).into_response();
+    }
+
+    let enabled = req.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+
+    // 更新数据库
+    if let Err(e) = queries::update_account_enabled(&state.db(), id, enabled).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("数据库更新失败: {}", e)})),
+        )
+            .into_response();
+    }
+
+    // 更新调度器
+    if enabled {
+        // 启用：如果账号不在调度器中，重新加载
+        if state.scheduler.get_account(id).is_none() {
+            if let Ok(Some(row)) = queries::get_account_by_id(&state.db(), id).await {
+                let creds: Credentials = serde_json::from_str(&row.credentials).unwrap_or_default();
+                let account = Arc::new(Account::new(row.id));
+                *account.email.write() = creds.email;
+                *account.plan_type.write() = creds.plan_type;
+                *account.proxy_url.write() = row.proxy_url;
+                *account.codex_account_id.write() = creds.account_id;
+                *account.access_token.write() = creds.access_token;
+                *account.refresh_token.write() = creds.refresh_token;
+
+                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&creds.expires_at) {
+                    *account.expires_at.write() = dt.with_timezone(&chrono::Utc);
+                }
+
+                state.scheduler.add_account(account);
+                info!(account_id = id, "账号已启用并加入调度器");
+            }
+        }
+    } else {
+        // 禁用：从调度器移除
+        state.scheduler.remove_account(id);
+        info!(account_id = id, "账号已禁用并移出调度器");
+    }
+
+    Json(json!({"message": "ok", "enabled": enabled})).into_response()
+}
+
 /// POST /api/admin/accounts/batch-refresh — 一键刷新所有有 RT 的账号
 pub async fn batch_refresh(
     State(state): State<Arc<AppState>>,
@@ -1468,6 +1521,7 @@ pub async fn ops_overview(
     let rpm = usage.as_ref().map(|u| u.rpm as f64).unwrap_or(0.0);
     let tpm = usage.as_ref().map(|u| u.tpm as f64).unwrap_or(0.0);
     let error_rate = usage.as_ref().map(|u| u.error_rate).unwrap_or(0.0);
+    let avg_duration_ms = usage.as_ref().map(|u| u.avg_duration_ms).unwrap_or(0.0);
 
     let qps = rpm / 60.0;
     let tps = tpm / 60.0;
@@ -1531,6 +1585,7 @@ pub async fn ops_overview(
             "today_requests": today_requests,
             "today_tokens": today_tokens,
             "rpm_limit": rpm_limit,
+            "avg_duration_ms": avg_duration_ms,
         },
     }))
     .into_response()
@@ -1762,11 +1817,15 @@ pub async fn create_key(
         .unwrap_or_else(|| format!("sk-{}", uuid::Uuid::new_v4().to_string().replace('-', "")));
 
     match queries::insert_api_key(&state.db(), &req.name, &key).await {
-        Ok(id) => (
-            StatusCode::CREATED,
-            Json(json!({"id": id, "key": key, "name": req.name})),
-        )
-            .into_response(),
+        Ok(id) => {
+            // 失效 /v1/* 鉴权缓存，使新 key 立即生效
+            state.api_keys.invalidate().await;
+            (
+                StatusCode::CREATED,
+                Json(json!({"id": id, "key": key, "name": req.name})),
+            )
+                .into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),
@@ -1786,7 +1845,11 @@ pub async fn delete_key(
     }
 
     match queries::delete_api_key(&state.db(), id).await {
-        Ok(_) => Json(json!({"message": "ok"})).into_response(),
+        Ok(_) => {
+            // 失效 /v1/* 鉴权缓存，使被删除的 key 立即失效
+            state.api_keys.invalidate().await;
+            Json(json!({"message": "ok"})).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": e.to_string()})),

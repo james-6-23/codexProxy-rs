@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Instant;
@@ -6,8 +7,9 @@ use dashmap::DashMap;
 use tokio::sync::mpsc;
 
 use crate::config::AppConfig;
-use crate::db::models::SystemSettings;
 use crate::db::DbPool;
+use crate::db::models::SystemSettings;
+use crate::proxy::auth::ApiKeyCache;
 use crate::proxy::ratelimit::RateLimiter;
 use crate::scheduler::Scheduler;
 use crate::token::cache::TokenCache;
@@ -29,6 +31,8 @@ pub struct AppState {
     pub qps_peak_100: AtomicI64,
     /// TPS 峰值（×100 存储）
     pub tps_peak_100: AtomicI64,
+    /// API Key 缓存（5 分钟 TTL，供 /v1/* 鉴权中间件使用）
+    pub api_keys: Arc<ApiKeyCache>,
 }
 
 impl AppState {
@@ -40,6 +44,7 @@ impl AppState {
         log_sender: mpsc::Sender<crate::db::models::UsageLog>,
         settings: SystemSettings,
     ) -> Self {
+        let api_keys = Arc::new(ApiKeyCache::new(db.clone()));
         Self {
             config,
             db: RwLock::new(db),
@@ -53,6 +58,7 @@ impl AppState {
             http_clients: DashMap::new(),
             qps_peak_100: AtomicI64::new(0),
             tps_peak_100: AtomicI64::new(0),
+            api_keys,
         }
     }
 

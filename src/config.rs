@@ -13,6 +13,16 @@ pub struct AppConfig {
     pub admin_secret: Option<String>,
     /// 全局默认代理 URL（可选）
     pub proxy_url: Option<String>,
+    /// 显式允许 /v1/* 在未配置 API Key 时无鉴权放行（默认禁止，fail-closed）
+    pub allow_anonymous_v1: bool,
+
+    // 设备指纹配置
+    pub device_user_agent: Option<String>,
+    pub device_package_version: Option<String>,
+    pub device_runtime_version: Option<String>,
+    pub device_os: Option<String>,
+    pub device_arch: Option<String>,
+    pub stabilize_device_profile: bool,
 }
 
 impl AppConfig {
@@ -40,6 +50,21 @@ impl AppConfig {
                 .unwrap_or(20),
             admin_secret: env::var("ADMIN_SECRET").ok().filter(|s| !s.is_empty()),
             proxy_url: env::var("PROXY_URL").ok().filter(|s| !s.is_empty()),
+            allow_anonymous_v1: env::var("CODEX_ALLOW_ANONYMOUS")
+                .ok()
+                .map(|s| s.trim().eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+
+            // 设备指纹配置（可选）
+            device_user_agent: env::var("CODEX_USER_AGENT").ok().filter(|s| !s.trim().is_empty()),
+            device_package_version: env::var("CODEX_PACKAGE_VERSION").ok().filter(|s| !s.trim().is_empty()),
+            device_runtime_version: env::var("CODEX_RUNTIME_VERSION").ok().filter(|s| !s.trim().is_empty()),
+            device_os: env::var("CODEX_OS").ok().filter(|s| !s.trim().is_empty()),
+            device_arch: env::var("CODEX_ARCH").ok().filter(|s| !s.trim().is_empty()),
+            stabilize_device_profile: env::var("STABILIZE_DEVICE_PROFILE")
+                .ok()
+                .map(|s| s.trim().eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
         }
     }
 }

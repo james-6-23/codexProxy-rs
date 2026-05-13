@@ -36,6 +36,7 @@ async fn create_tables(pool: &PgPool) -> Result<()> {
             error_message   TEXT NOT NULL DEFAULT '',
             cooldown_reason TEXT NOT NULL DEFAULT '',
             cooldown_until  TIMESTAMPTZ,
+            enable_scheduling BOOLEAN NOT NULL DEFAULT TRUE,
             created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )",
@@ -60,6 +61,7 @@ async fn create_tables(pool: &PgPool) -> Result<()> {
             stream              BOOLEAN NOT NULL DEFAULT FALSE,
             service_tier        TEXT NOT NULL DEFAULT '',
             account_email       TEXT NOT NULL DEFAULT '',
+            cost                DOUBLE PRECISION NOT NULL DEFAULT 0,
             created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )",
         "CREATE INDEX IF NOT EXISTS idx_usage_logs_created ON usage_logs(created_at)",
@@ -87,6 +89,14 @@ async fn create_tables(pool: &PgPool) -> Result<()> {
             max_retries             INT NOT NULL DEFAULT 2,
             pg_max_conns            INT NOT NULL DEFAULT 256
         )",
+        // 兼容已有表：添加 enable_scheduling 列
+        "DO $$ BEGIN
+            ALTER TABLE accounts ADD COLUMN enable_scheduling BOOLEAN NOT NULL DEFAULT TRUE;
+        EXCEPTION WHEN duplicate_column THEN NULL; END $$",
+        // 兼容已有表：添加 cost 列到 usage_logs
+        "DO $$ BEGIN
+            ALTER TABLE usage_logs ADD COLUMN cost DOUBLE PRECISION NOT NULL DEFAULT 0;
+        EXCEPTION WHEN duplicate_column THEN NULL; END $$",
         // 兼容已有表：添加 pg_max_conns 列
         "DO $$ BEGIN
             ALTER TABLE system_settings ADD COLUMN pg_max_conns INT NOT NULL DEFAULT 256;

@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
+use dashmap::{DashMap, DashSet};
 use parking_lot::RwLock;
 use tokio::sync::Notify;
 
@@ -50,6 +51,8 @@ pub struct Account {
     pub health_tier: AtomicU8,
     /// 评分 × 100 存储为整数（如 8520 = 85.20）
     pub score: AtomicI64,
+    /// 评分缓存时间戳（unix timestamp）
+    pub score_cached_at: AtomicI64,
     pub dynamic_concurrency_limit: AtomicI64,
     pub cooldown_until: AtomicI64, // unix timestamp，0 = 无冷却
 
@@ -139,6 +142,7 @@ impl Account {
             error_requests: AtomicU64::new(0),
             health_tier: AtomicU8::new(TIER_HEALTHY),
             score: AtomicI64::new(10000), // 100.00
+            score_cached_at: AtomicI64::new(0),
             dynamic_concurrency_limit: AtomicI64::new(2),
             cooldown_until: AtomicI64::new(0),
             latency_ewma_100: AtomicI64::new(0),
@@ -268,6 +272,10 @@ pub struct Scheduler {
     pub accounts: RwLock<Vec<Arc<Account>>>,
     /// 分桶索引：按 tier 分组的账号索引
     pub tier_buckets: RwLock<TierBuckets>,
+    /// Session Affinity: session_id -> (account_id, last_used)
+    pub session_affinity: DashMap<String, (i64, Instant)>,
+    /// 正在刷新 Token 的账号集合（防止重复刷新）
+    pub refreshing_accounts: DashSet<i64>,
     /// 通知：有账号变为可用时唤醒等待者
     pub available_notify: Notify,
     /// 最大并发配置
@@ -298,6 +306,8 @@ impl Scheduler {
         Self {
             accounts: RwLock::new(Vec::new()),
             tier_buckets: RwLock::new(TierBuckets::default()),
+            session_affinity: DashMap::new(),
+            refreshing_accounts: DashSet::new(),
             available_notify: Notify::new(),
             max_concurrency: AtomicI64::new(max_concurrency),
         }
@@ -311,9 +321,28 @@ impl Scheduler {
         self.rebuild_buckets();
     }
 
+    /// 清理过期的 session affinity 绑定
+    pub fn cleanup_stale_sessions(&self, max_age_secs: i64) {
+        let now = Instant::now();
+
+        self.session_affinity.retain(|_, (account_id, last_used)| {
+            // 检查时间是否过期
+            if now.duration_since(*last_used).as_secs() > max_age_secs as u64 {
+                return false;
+            }
+
+            // 检查账号是否还存在
+            self.get_account(*account_id).is_some()
+        });
+    }
+
     /// 移除账号
     pub fn remove_account(&self, db_id: i64) {
         self.accounts.write().retain(|a| a.db_id != db_id);
+
+        // 清理该账号的 session 绑定
+        self.session_affinity.retain(|_, (account_id, _)| *account_id != db_id);
+
         self.rebuild_buckets();
     }
 

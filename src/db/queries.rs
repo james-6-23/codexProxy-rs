@@ -33,6 +33,7 @@ pub async fn list_active_accounts(pool: &DbPool) -> Result<Vec<AccountRow>> {
         "SELECT id, name, platform, type, credentials::TEXT, proxy_url, status,
                 error_message, cooldown_reason,
                 TO_CHAR(cooldown_until AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS cooldown_until,
+                COALESCE(enable_scheduling, TRUE) AS enable_scheduling,
                 TO_CHAR(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at,
                 TO_CHAR(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at
          FROM accounts WHERE status = 'active' ORDER BY id",
@@ -121,6 +122,33 @@ pub async fn delete_account(pool: &DbPool, id: i64) -> Result<()> {
     Ok(())
 }
 
+/// 更新账号调度启用状态
+pub async fn update_account_enabled(pool: &DbPool, id: i64, enabled: bool) -> Result<()> {
+    sqlx::query("UPDATE accounts SET enable_scheduling = $1, updated_at = NOW() WHERE id = $2")
+        .bind(enabled)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// 根据 ID 获取单个账号
+pub async fn get_account_by_id(pool: &DbPool, id: i64) -> Result<Option<AccountRow>> {
+    let row = sqlx::query_as::<_, AccountRow>(
+        "SELECT id, name, platform, type, credentials::TEXT, proxy_url, status,
+                error_message, cooldown_reason,
+                TO_CHAR(cooldown_until AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS cooldown_until,
+                COALESCE(enable_scheduling, TRUE) AS enable_scheduling,
+                TO_CHAR(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS created_at,
+                TO_CHAR(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') AS updated_at
+         FROM accounts WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row)
+}
+
 // ─── 使用日志 ───
 
 pub async fn batch_insert_usage_logs(pool: &DbPool, logs: &[UsageLog]) -> Result<()> {
@@ -128,11 +156,21 @@ pub async fn batch_insert_usage_logs(pool: &DbPool, logs: &[UsageLog]) -> Result
         return Ok(());
     }
 
+    // 分批插入，每批最多 20 条，避免超过 PostgreSQL 参数限制
+    const BATCH_SIZE: usize = 20;
+    for chunk in logs.chunks(BATCH_SIZE) {
+        insert_usage_logs_chunk(pool, chunk).await?;
+    }
+    Ok(())
+}
+
+/// 插入单批日志（内部函数）
+async fn insert_usage_logs_chunk(pool: &DbPool, logs: &[UsageLog]) -> Result<()> {
     // 构建批量 INSERT（PostgreSQL 支持多行 VALUES）
     let mut query = String::from(
         "INSERT INTO usage_logs (account_id, endpoint, model, prompt_tokens, completion_tokens,
          total_tokens, input_tokens, output_tokens, reasoning_tokens, cached_tokens,
-         first_token_ms, reasoning_effort, status_code, duration_ms, stream, service_tier, account_email) VALUES ",
+         first_token_ms, reasoning_effort, status_code, duration_ms, stream, service_tier, account_email, cost) VALUES ",
     );
 
     let mut params_idx = 1u32;
@@ -141,7 +179,7 @@ pub async fn batch_insert_usage_logs(pool: &DbPool, logs: &[UsageLog]) -> Result
             query.push(',');
         }
         query.push('(');
-        for j in 0..17 {
+        for j in 0..18 {
             if j > 0 {
                 query.push(',');
             }
@@ -171,7 +209,8 @@ pub async fn batch_insert_usage_logs(pool: &DbPool, logs: &[UsageLog]) -> Result
             .bind(log.duration_ms)
             .bind(log.stream)
             .bind(&log.service_tier)
-            .bind(&log.account_email);
+            .bind(&log.account_email)
+            .bind(log.cost);
     }
 
     q.execute(pool).await?;

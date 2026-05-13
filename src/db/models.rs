@@ -15,6 +15,8 @@ pub struct AccountRow {
     pub error_message: String,
     pub cooldown_reason: String,
     pub cooldown_until: Option<String>,
+    #[sqlx(default)]
+    pub enable_scheduling: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -70,6 +72,7 @@ pub struct UsageLog {
     pub stream: bool,
     pub service_tier: String,
     pub account_email: String,
+    pub cost: f64,
     pub created_at: String,
 }
 

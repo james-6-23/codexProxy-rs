@@ -1,4 +1,5 @@
 mod admin;
+mod billing;
 mod config;
 mod db;
 mod proxy;
@@ -7,7 +8,7 @@ mod state;
 mod token;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::Path;
 use axum::response::IntoResponse;
@@ -68,7 +69,13 @@ async fn main() {
     // 从数据库加载现有账号
     let db_accounts = db::queries::list_active_accounts(&db_pool).await.unwrap_or_default();
     let loaded_count = db_accounts.len();
+    let mut enabled_count = 0;
     for row in db_accounts {
+        // 跳过禁用调度的账号
+        if !row.enable_scheduling {
+            continue;
+        }
+
         let creds: db::models::Credentials =
             serde_json::from_str(&row.credentials).unwrap_or_default();
 
@@ -151,8 +158,9 @@ async fn main() {
         }
 
         scheduler.add_account(account);
+        enabled_count += 1;
     }
-    info!(count = loaded_count, "已加载账号到调度器");
+    info!(total = loaded_count, enabled = enabled_count, "已加载账号到调度器");
 
     // 从数据库恢复请求计数（跨重启保持一致）
     if let Ok(counts) = db::queries::get_account_request_counts(&db_pool).await {
@@ -180,6 +188,16 @@ async fn main() {
         settings,
     ));
 
+    // 启动时检查 API Key 配置 + 匿名访问警告（fail-closed 提示）
+    let has_keys = state.api_keys.has_any().await;
+    if !has_keys {
+        if config.allow_anonymous_v1 {
+            warn!("⚠ /v1/* 当前处于【匿名访问】模式（CODEX_ALLOW_ANONYMOUS=true）。生产环境请创建 API Key 后取消此设置。");
+        } else {
+            warn!("⚠ 尚未配置任何 API Key，/v1/* 路由将拒绝所有请求（503）。请在管理后台创建 API Key，或设置 CODEX_ALLOW_ANONYMOUS=true。");
+        }
+    }
+
     // 启动后台任务
     spawn_background_tasks(state.clone(), log_rx);
 
@@ -203,11 +221,29 @@ async fn main() {
 fn build_router(state: Arc<AppState>) -> Router {
     let cors = CorsLayer::permissive();
 
-    // 代理 API
+    // 代理 API（含 /v1 前缀、无前缀兼容、Codex CLI 原生路径三组路由）
+    // 全部挂上 API Key 鉴权中间件（fail-closed）
     let proxy_routes = Router::new()
+        // /v1 前缀（标准）
         .route("/v1/chat/completions", post(proxy::handler::chat_completions))
         .route("/v1/responses", post(proxy::handler::responses))
-        .route("/v1/models", get(proxy::handler::list_models));
+        .route("/v1/responses/compact", post(proxy::handler::responses_compact))
+        .route("/v1/models", get(proxy::handler::list_models))
+        // 无前缀兼容（base_url 已含 /v1 的客户端）
+        .route("/chat/completions", post(proxy::handler::chat_completions))
+        .route("/responses", post(proxy::handler::responses))
+        .route("/responses/compact", post(proxy::handler::responses_compact))
+        .route("/models", get(proxy::handler::list_models))
+        // Codex CLI 原生路径（base_url=https://host 直连）
+        .route("/backend-api/codex/responses", post(proxy::handler::responses))
+        .route(
+            "/backend-api/codex/responses/compact",
+            post(proxy::handler::responses_compact),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            proxy::auth::require_api_key,
+        ));
 
     // 管理 API — 匹配前端 api.ts 的全部端点
     let admin_routes = Router::new()
@@ -223,6 +259,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/admin/accounts/{id}", delete(admin::handler::delete_account))
         .route("/api/admin/accounts/batch-delete", post(admin::handler::batch_delete_accounts))
         .route("/api/admin/accounts/{id}/refresh", post(admin::handler::refresh_account))
+        .route("/api/admin/accounts/{id}/enable", post(admin::handler::toggle_account_enabled))
         .route("/api/admin/accounts/batch-refresh", post(admin::handler::batch_refresh))
         .route("/api/admin/accounts/{id}/test", get(admin::handler::test_connection))
         .route("/api/admin/accounts/{id}/usage", get(admin::handler::account_usage))
@@ -345,18 +382,43 @@ fn spawn_background_tasks(
     state: Arc<AppState>,
     mut log_rx: tokio::sync::mpsc::Receiver<UsageLog>,
 ) {
-    // 1. 使用日志批量写入
+    // 1. 使用日志批量写入（自适应批量大小）
     let db = state.db();
     tokio::spawn(async move {
-        let mut buffer: Vec<UsageLog> = Vec::with_capacity(64);
-        // 使用 interval 而非 sleep — interval 不会因 recv 分支触发而重置
+        let mut buffer: Vec<UsageLog> = Vec::with_capacity(512);
         let mut flush_tick = tokio::time::interval(Duration::from_secs(2));
         flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let mut last_qps_check = Instant::now();
+        let mut current_batch_size = 128; // 初始批量大小
+        let mut request_count = 0;
+
         loop {
             tokio::select! {
                 Some(log) = log_rx.recv() => {
                     buffer.push(log);
-                    if buffer.len() >= 64 {
+                    request_count += 1;
+
+                    // 动态调整批量大小（每 10 秒检查一次）
+                    if last_qps_check.elapsed() > Duration::from_secs(10) {
+                        let elapsed_secs = last_qps_check.elapsed().as_secs_f64();
+                        let qps = request_count as f64 / elapsed_secs;
+
+                        // 根据 QPS 自适应调整批量大小
+                        current_batch_size = if qps > 500.0 {
+                            512  // 高负载：大批量减少写入频率
+                        } else if qps > 100.0 {
+                            256  // 中负载：中等批量
+                        } else {
+                            128  // 低负载：小批量快速写入
+                        };
+
+                        last_qps_check = Instant::now();
+                        request_count = 0;
+                    }
+
+                    // 达到批量大小时触发写入
+                    if buffer.len() >= current_batch_size {
                         if let Err(e) = db::queries::batch_insert_usage_logs(&db, &buffer).await {
                             error!("批量写入日志失败: {}", e);
                         }
@@ -364,6 +426,7 @@ fn spawn_background_tasks(
                     }
                 }
                 _ = flush_tick.tick() => {
+                    // 定时刷新（避免低流量时日志积压）
                     if !buffer.is_empty() {
                         if let Err(e) = db::queries::batch_insert_usage_logs(&db, &buffer).await {
                             error!("批量写入日志失败: {}", e);
@@ -456,6 +519,22 @@ fn spawn_background_tasks(
             check_usage_reset(&state9).await;
         }
     });
+
+    // 10. Session Affinity 清理（每小时）
+    let state10 = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(3600));
+        loop {
+            interval.tick().await;
+            let before = state10.scheduler.session_affinity.len();
+            state10.scheduler.cleanup_stale_sessions(3600); // 清理 1 小时未用的
+            let after = state10.scheduler.session_affinity.len();
+            let cleaned = before.saturating_sub(after);
+            if cleaned > 0 {
+                info!(cleaned, "清理过期 session affinity 绑定");
+            }
+        }
+    });
 }
 
 /// 刷新即将过期的 Token
@@ -476,9 +555,9 @@ async fn refresh_expiring_tokens(state: &AppState, client: &reqwest::Client) {
             continue;
         }
 
-        // 检查缓存锁
-        if !state.token_cache.acquire_refresh_lock(acc.db_id, Duration::from_secs(30)) {
-            continue;
+        // 使用 DashSet 防止重复刷新（替代 token_cache 锁）
+        if !state.scheduler.refreshing_accounts.insert(acc.db_id) {
+            continue; // 已在刷新中
         }
 
         let client = client.clone();
@@ -486,8 +565,11 @@ async fn refresh_expiring_tokens(state: &AppState, client: &reqwest::Client) {
         let db = state.db();
 
         let acc_clone = acc.clone();
+        let account_id = acc.db_id;
+
         handles.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
+
             match token::refresh::refresh_with_retry(&client, &rt).await {
                 Ok(resp) => {
                     let info = token::parse_id_token(&resp.id_token).unwrap_or_default();
@@ -531,6 +613,9 @@ async fn refresh_expiring_tokens(state: &AppState, client: &reqwest::Client) {
     for h in handles {
         let _ = h.await;
     }
+
+    // 批量清理刷新标记
+    state.scheduler.refreshing_accounts.clear();
 }
 
 /// 探测 banned 账号是否恢复

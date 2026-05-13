@@ -1,5 +1,6 @@
 use super::*;
 use std::sync::atomic::Ordering;
+use tracing::info;
 
 impl Scheduler {
     /// 根据账号状态重新计算健康等级和动态并发
@@ -49,10 +50,17 @@ impl Scheduler {
             .store(concurrency, Ordering::Relaxed);
     }
 
-    /// 标记账号进入冷却（限流/禁用）
+    /// 标记账号进入冷却（限流/禁用）。`reason` 用于结构化日志，便于追踪冷却原因。
     pub fn mark_cooldown(&self, account: &Account, reason: &str, duration_secs: i64) {
         let until = chrono::Utc::now().timestamp() + duration_secs;
         account.cooldown_until.store(until, Ordering::Relaxed);
+        info!(
+            account_id = account.db_id,
+            reason = reason,
+            duration_secs = duration_secs,
+            until = until,
+            "账号进入冷却"
+        );
         self.recompute_health(account);
     }
 

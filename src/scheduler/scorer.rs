@@ -301,11 +301,11 @@ mod tests {
         *acc.plan_type.write() = "plus".to_string();
         *acc.access_token.write() = "tok".to_string();
         let now = chrono::Utc::now().timestamp();
-        // 1 秒后 reset，配额 0% 用 → 满奖励
-        acc.resets_at.store(now + 1, Ordering::Relaxed);
+        // 10 秒后 reset，配额 0% 用 → 近满奖励（避免 CI flake：now+1 在慢机器上可能 time_remaining<=0）
+        acc.resets_at.store(now + 10, Ordering::Relaxed);
         acc.usage_7d_pct_100.store(0, Ordering::Relaxed);
         let bonus = Scorer::urgency_bonus_7d(&acc, now);
-        // time_factor ≈ 1.0, quota_factor=1.0, weighted=1.0 → ~80.0
+        // 10/259200 ≈ 0，time_factor 仍 ≈ 1.0；quota_factor=1.0, weighted=1.0 → ~80.0
         assert!(bonus > 79.0 && bonus <= 80.0, "bonus = {}", bonus);
     }
 

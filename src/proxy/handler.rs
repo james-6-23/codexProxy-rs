@@ -1180,6 +1180,15 @@ pub(crate) fn get_or_create_client(state: &AppState, account_proxy: &str) -> req
 }
 
 /// 解析 429 冷却时间 — 按 plan 和响应 header/body 智能判断
+/// 从上游 429 响应解析冷却时长（秒）。
+///
+/// 优先顺序：header (x-ratelimit-reset-requests) → body (/error/resets_at int /
+/// resets_at ISO string / resets_in_seconds 顶层 / /error/resets_in_seconds) →
+/// model-at-capacity 兜底 (5min)。
+///
+/// **60s 下限**：每个分支返回值都用 .max(60) 强制最小 60 秒。上游有时返回极短
+/// 的 reset 时间（例如 1-5 秒），立刻重试会形成 thundering herd，所以这里强制
+/// 最小 60s。这是 rs 相对 Go (parseRetryAfter 无下限) 的刻意偏移，避免雪崩。
 pub(crate) fn parse_rate_limit_cooldown(
     headers: &HeaderMap,
     error_body: &str,
@@ -1833,5 +1842,121 @@ mod tests {
         let resp = final_usage_limit_response(&d);
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert!(resp.headers().get("Retry-After").is_none());
+    }
+
+    fn mk_account() -> crate::scheduler::Account {
+        let acc = crate::scheduler::Account::new(1);
+        *acc.plan_type.write() = "plus".to_string();
+        acc
+    }
+
+    #[test]
+    fn parse_rate_limit_cooldown_from_header_floors_at_60() {
+        let mut h = HeaderMap::new();
+        let now = chrono::Utc::now().timestamp();
+        // 5 秒后 reset，应被强制到 60s
+        h.insert(
+            "x-ratelimit-reset-requests",
+            (now + 5).to_string().parse().unwrap(),
+        );
+        let acc = mk_account();
+        assert_eq!(parse_rate_limit_cooldown(&h, "", &acc), 60);
+    }
+
+    #[test]
+    fn parse_rate_limit_cooldown_body_resets_in_seconds_top_level() {
+        let h = HeaderMap::new();
+        let acc = mk_account();
+        let body = r#"{"resets_in_seconds": 300}"#;
+        assert_eq!(parse_rate_limit_cooldown(&h, body, &acc), 300);
+    }
+
+    #[test]
+    fn parse_rate_limit_cooldown_body_error_resets_in_seconds() {
+        let h = HeaderMap::new();
+        let acc = mk_account();
+        let body = r#"{"error":{"resets_in_seconds": 1800}}"#;
+        assert_eq!(parse_rate_limit_cooldown(&h, body, &acc), 1800);
+    }
+
+    #[test]
+    fn parse_rate_limit_cooldown_body_resets_at_iso_floors() {
+        let h = HeaderMap::new();
+        let acc = mk_account();
+        let dt = (chrono::Utc::now() + chrono::Duration::seconds(10)).to_rfc3339();
+        let body = format!(r#"{{"resets_at":"{}"}}"#, dt);
+        // 10 秒后 reset → floor 到 60
+        assert_eq!(parse_rate_limit_cooldown(&h, &body, &acc), 60);
+    }
+
+    #[test]
+    fn parse_rate_limit_cooldown_body_error_resets_at_int() {
+        let h = HeaderMap::new();
+        let acc = mk_account();
+        let now = chrono::Utc::now().timestamp();
+        let body = format!(r#"{{"error":{{"resets_at": {}}}}}"#, now + 7200);
+        let cooldown = parse_rate_limit_cooldown(&h, &body, &acc);
+        // 2h 后 reset → 应返回 ~7200 秒
+        assert!(
+            cooldown >= 7190 && cooldown <= 7200,
+            "cooldown = {}",
+            cooldown
+        );
+    }
+
+    #[test]
+    fn parse_rate_limit_cooldown_model_capacity_fallback_5min() {
+        let h = HeaderMap::new();
+        let acc = mk_account();
+        // is_codex_model_capacity_error 匹配 message 中包含 "at capacity"
+        let body = r#"{"error":{"message":"The selected model is at capacity"}}"#;
+        assert_eq!(parse_rate_limit_cooldown(&h, body, &acc), 300);
+    }
+
+    #[test]
+    fn parse_rate_limit_cooldown_dual_window_primary_5h() {
+        let mut h = HeaderMap::new();
+        h.insert("x-codex-primary-used-percent", "100".parse().unwrap());
+        h.insert("x-codex-primary-window-minutes", "300".parse().unwrap());
+        let acc = mk_account();
+        // primary 100% + 300min(5h) 窗口 → 5h 冷却
+        assert_eq!(parse_rate_limit_cooldown(&h, "", &acc), 5 * 3600);
+    }
+
+    #[test]
+    fn parse_rate_limit_cooldown_dual_window_secondary_7d() {
+        let mut h = HeaderMap::new();
+        h.insert("x-codex-secondary-used-percent", "100".parse().unwrap());
+        h.insert("x-codex-secondary-window-minutes", "10080".parse().unwrap());
+        let acc = mk_account();
+        // secondary 100% + 10080min(7d) 窗口 → 7d 冷却
+        assert_eq!(parse_rate_limit_cooldown(&h, "", &acc), 7 * 24 * 3600);
+    }
+
+    #[test]
+    fn parse_rate_limit_cooldown_dual_window_under_100_short_cooldown() {
+        let mut h = HeaderMap::new();
+        h.insert("x-codex-primary-used-percent", "50".parse().unwrap());
+        h.insert("x-codex-secondary-used-percent", "30".parse().unwrap());
+        let acc = mk_account();
+        // 突发限流（usage 未满），短时冷却 60s
+        assert_eq!(parse_rate_limit_cooldown(&h, "", &acc), 60);
+    }
+
+    #[test]
+    fn parse_rate_limit_cooldown_no_signal_plus_plan_fallback_1h() {
+        let h = HeaderMap::new();
+        let acc = mk_account();
+        // 无 header / 无 body 信号，paid 计划 fallback 到 1h
+        assert_eq!(parse_rate_limit_cooldown(&h, "", &acc), 3600);
+    }
+
+    #[test]
+    fn parse_rate_limit_cooldown_no_signal_free_plan_fallback_7d() {
+        let h = HeaderMap::new();
+        let acc = crate::scheduler::Account::new(2);
+        *acc.plan_type.write() = "free".to_string();
+        // free 计划无信号 fallback 到 7d
+        assert_eq!(parse_rate_limit_cooldown(&h, "", &acc), 7 * 24 * 3600);
     }
 }

@@ -349,7 +349,7 @@ export default function Usage() {
                 className="w-32"
                 compact
                 value={filterStream}
-                onValueChange={(v) => { setFilterStream(v); setPage(1) }}
+                onValueChange={(v) => { setFilterStream(v as '' | 'true' | 'false'); setPage(1) }}
                 placeholder={t('usage.allTypes')}
                 options={[
                   { label: t('usage.allTypes'), value: '' },

@@ -82,7 +82,7 @@ export function Select({
       </button>
 
       {open ? (
-        <div className={cn('absolute top-[calc(100%+0.5rem)] left-0 z-50 overflow-hidden border border-border bg-popover shadow-[0_18px_40px_hsl(258_30%_18%/0.12)] backdrop-blur-sm', compact ? 'min-w-full rounded-lg' : 'right-0 rounded-2xl')}>
+        <div className={cn('absolute top-[calc(100%+0.5rem)] left-0 z-50 overflow-hidden border border-border bg-popover shadow-[0_18px_40px_hsl(222_30%_18%/0.12)] backdrop-blur-sm', compact ? 'min-w-full rounded-lg' : 'right-0 rounded-lg')}>
           <div className={cn('max-h-72 overflow-auto', compact ? 'p-1' : 'p-2')}>
             <div role="listbox" aria-activedescendant={value || undefined} className={compact ? 'space-y-0.5' : 'space-y-1'}>
               {options.map((option) => {
@@ -96,7 +96,7 @@ export function Select({
                     aria-selected={isSelected}
                     className={cn(
                       'flex w-full items-center justify-between gap-3 text-left transition-colors',
-                      compact ? 'rounded-md px-2 py-1.5 text-[13px]' : 'rounded-xl px-3 py-2.5 text-[15px]',
+                      compact ? 'rounded-md px-2 py-1.5 text-[13px]' : 'rounded-md px-3 py-2.5 text-[15px]',
                       isSelected
                         ? 'bg-primary/10 text-primary'
                         : 'text-foreground hover:bg-accent/70 hover:text-accent-foreground'

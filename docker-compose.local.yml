@@ -1,48 +1,179 @@
-# 本地构建部署
-name: codex-proxy-local
+# Codex Proxy - 优化版 Docker Compose 配置
+# 本地开发/生产环境通用配置
+
+name: codex-proxy
 
 services:
+  # ============================================================
+  # 主应用服务
+  # ============================================================
   codex-proxy:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: codex-proxy:latest
     container_name: codex-proxy
+
+    # 端口映射
     ports:
       - "${CODEX_PORT:-8080}:8080"
+
+    # 环境变量
     environment:
       - CODEX_PORT=8080
-      - DATABASE_URL=postgres://codex:codex@postgres:5432/codex2api
+      - DATABASE_URL=postgres://codex:${POSTGRES_PASSWORD:-codex}@postgres:5432/${POSTGRES_DB:-codex2api}
       - ADMIN_SECRET=${ADMIN_SECRET:-}
       - PROXY_URL=${PROXY_URL:-}
       - TZ=${TZ:-Asia/Shanghai}
+      - RUST_LOG=${RUST_LOG:-info}
+      - RUST_BACKTRACE=${RUST_BACKTRACE:-0}
+
+    # 依赖关系
     depends_on:
       postgres:
         condition: service_healthy
+
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    # 资源限制
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+
+    # 重启策略
     restart: unless-stopped
+
+    # 日志配置
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
     networks:
       - codex-net
 
+  # ============================================================
+  # PostgreSQL 数据库
+  # ============================================================
   postgres:
-    image: postgres:18-alpine
+    image: postgres:16-alpine
     container_name: codex-proxy-pg
+
+    # 环境变量
     environment:
-      - POSTGRES_USER=codex
-      - POSTGRES_PASSWORD=codex
-      - POSTGRES_DB=codex2api
+      - POSTGRES_USER=${POSTGRES_USER:-codex}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-codex}
+      - POSTGRES_DB=${POSTGRES_DB:-codex2api}
+      - POSTGRES_INITDB_ARGS=--encoding=UTF-8 --lc-collate=C --lc-ctype=C
       - TZ=${TZ:-Asia/Shanghai}
+      - PGDATA=/var/lib/postgresql/data/pgdata
+
+    # 数据卷
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./backups:/backups  # 备份目录
+
+    # 健康检查
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U codex -d codex2api"]
-      interval: 3s
-      timeout: 3s
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-codex} -d ${POSTGRES_DB:-codex2api}"]
+      interval: 10s
+      timeout: 5s
       retries: 5
+      start_period: 10s
+
+    # 资源限制
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+
+    # 重启策略
     restart: unless-stopped
+
+    # 日志配置
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # 安全配置
+    security_opt:
+      - no-new-privileges:true
+
     networks:
       - codex-net
 
+  # ============================================================
+  # 可选：PostgreSQL 备份服务
+  # ============================================================
+  postgres-backup:
+    image: postgres:16-alpine
+    container_name: codex-proxy-backup
+    profiles: ["backup"]  # 默认不启动，需要指定 profile
+
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-codex}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-codex}
+      - POSTGRES_DB=${POSTGRES_DB:-codex2api}
+      - POSTGRES_HOST=postgres
+      - BACKUP_KEEP_DAYS=${BACKUP_KEEP_DAYS:-7}
+      - TZ=${TZ:-Asia/Shanghai}
+
+    volumes:
+      - ./backups:/backups
+      - ./scripts/backup.sh:/backup.sh:ro
+
+    command: >
+      sh -c "
+        while true; do
+          echo '[$(date)] Starting backup...'
+          pg_dump -h postgres -U ${POSTGRES_USER:-codex} -d ${POSTGRES_DB:-codex2api} | gzip > /backups/backup_$(date +%Y%m%d_%H%M%S).sql.gz
+          echo '[$(date)] Backup completed'
+          find /backups -name 'backup_*.sql.gz' -mtime +${BACKUP_KEEP_DAYS:-7} -delete
+          sleep 86400
+        done
+      "
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    restart: unless-stopped
+
+    networks:
+      - codex-net
+
+# ============================================================
+# 网络配置
+# ============================================================
 networks:
   codex-net:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
 
+# ============================================================
+# 数据卷配置
+# ============================================================
 volumes:
   pgdata:
-    name: codex-proxy-local_pgdata
+    name: codex-proxy_pgdata
+    driver: local

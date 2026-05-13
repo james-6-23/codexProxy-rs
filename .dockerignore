@@ -1,34 +1,64 @@
 # Git
-.git/
+.git
 .gitignore
+.gitattributes
 
-# Go 原版
-codex2api/
+# 文档
+*.md
+LICENSE
+docs/
 
-# Rust 构建产物
-target/
-
-# 前端依赖（Docker 内重新安装）
-frontend/node_modules/
-frontend/dist/
+# CI/CD
+.github/
+.gitlab-ci.yml
 
 # IDE
 .vscode/
 .idea/
 *.swp
+*.swo
+*~
 
-# 系统
-.DS_Store
-Thumbs.db
+# 构建产物
+target/
+dist/
+build/
 
-# 环境
+# 依赖
+node_modules/
+
+# 日志
+*.log
+logs/
+
+# 环境变量
 .env
-.env.local
+.env.*
+!.env.example
+
+# 备份
+backups/
+*.sql
+*.sql.gz
 
 # Docker
+Dockerfile*
 docker-compose*.yml
 .dockerignore
 
-# 数据
-data/
-*.db
+# 临时文件
+tmp/
+temp/
+*.tmp
+
+# 测试
+coverage/
+.nyc_output/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 部署脚本
+deploy*.sh
+scripts/

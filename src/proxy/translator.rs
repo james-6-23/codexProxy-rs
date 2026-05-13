@@ -1112,10 +1112,13 @@ impl StreamTranslator {
                             | "response.function_call_arguments.done"
                             | "response.reasoning_summary_part.added"
                             | "response.reasoning_summary_part.done"
+                            | "response.reasoning_summary_text.delta"
                             | "response.reasoning_summary_text.done"
+                            | "response.reasoning_text.delta"
+                            | "response.reasoning_text.done"
                             | "response.reasoning.encrypted_content.delta"
                             | "response.reasoning.encrypted_content.done" => {
-                                // 静默丢弃
+                                // 静默丢弃 — rs 不向 OpenAI 客户端透传 reasoning，避免协议噪音
                             }
 
                             // 其他事件透传
@@ -1650,6 +1653,21 @@ mod tests {
         // Noise should not be forwarded
         assert!(!s.contains("response.created"));
         assert!(!s.contains("response.in_progress"));
+    }
+
+    #[test]
+    fn stream_reasoning_deltas_dropped() {
+        // 移植自 codex2api 一致性：reasoning_*.delta 不应透传给 OpenAI 客户端
+        let mut t = StreamTranslator::new();
+        let chunk = concat!(
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"response_id\":\"r1\",\"delta\":\"思考中…\"}\n\n",
+            "data: {\"type\":\"response.reasoning_text.delta\",\"response_id\":\"r1\",\"delta\":\"hidden\"}\n\n",
+        );
+        let out = t.translate_chunk(chunk.as_bytes()).unwrap();
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.contains("reasoning_summary_text"), "summary delta leaked: {}", s);
+        assert!(!s.contains("reasoning_text"), "reasoning text delta leaked: {}", s);
+        assert!(!s.contains("思考中"), "reasoning content leaked: {}", s);
     }
 
     #[test]

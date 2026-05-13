@@ -29,7 +29,7 @@ services:
       - POSTGRES_DB=codex2api
       - TZ=${TZ:-Asia/Shanghai}
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U codex -d codex2api"]
       interval: 3s

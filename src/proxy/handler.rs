@@ -17,13 +17,39 @@ use crate::proxy::translator::{self, StreamTranslator, UsageInfo};
 use crate::scheduler::FailureType;
 use crate::state::AppState;
 
+/// 代理模式 — 决定上游路径与响应回收方式
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyMode {
+    /// 标准 /responses：流式 SSE 转发或翻译为 chat completions
+    Stream,
+    /// /responses/compact：非流式，等上游一次性 JSON 响应后透传
+    Compact,
+}
+
+impl ProxyMode {
+    fn upstream_path(self) -> &'static str {
+        match self {
+            ProxyMode::Stream => "/responses",
+            ProxyMode::Compact => "/responses/compact",
+        }
+    }
+}
+
 /// POST /v1/chat/completions
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    proxy_request(state, headers, body, "/v1/chat/completions", true).await
+    proxy_request(
+        state,
+        headers,
+        body,
+        "/v1/chat/completions",
+        true,
+        ProxyMode::Stream,
+    )
+    .await
 }
 
 /// POST /v1/responses
@@ -32,7 +58,99 @@ pub async fn responses(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    proxy_request(state, headers, body, "/v1/responses", false).await
+    if let Some(resp) = validate_responses_body(&body, false) {
+        return resp;
+    }
+    proxy_request(state, headers, body, "/v1/responses", false, ProxyMode::Stream).await
+}
+
+/// POST /v1/responses/compact
+pub async fn responses_compact(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Some(resp) = validate_responses_body(&body, true) {
+        return resp;
+    }
+    proxy_request(
+        state,
+        headers,
+        body,
+        "/v1/responses/compact",
+        false,
+        ProxyMode::Compact,
+    )
+    .await
+}
+
+/// 校验 /v1/responses 系列请求体（与 Go 版 ResponsesAPIValidationRules 对齐的子集）
+///
+/// `strict_model` 为 true 时（compact 用），要求 `model` 必填且 ∈ SUPPORTED_MODELS。
+fn validate_responses_body(body: &Bytes, strict_model: bool) -> Option<Response> {
+    // 1. 大小上限
+    if body.len() > super::MAX_REQUEST_BODY_SIZE {
+        return Some(error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &format!(
+                "请求体过大: {} 字节，上限 {} 字节",
+                body.len(),
+                super::MAX_REQUEST_BODY_SIZE
+            ),
+        ));
+    }
+
+    // 2. JSON 解析
+    let body_json: Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return Some(error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("无效 JSON: {}", e),
+            ));
+        }
+    };
+
+    // 3. max_output_tokens 范围
+    if let Some(max_tokens) = body_json.get("max_output_tokens") {
+        if let Some(val) = max_tokens.as_i64() {
+            if val > 128000 {
+                return Some(error_response(
+                    StatusCode::BAD_REQUEST,
+                    &format!("max_output_tokens 超过上限 128000，当前值: {}", val),
+                ));
+            }
+            if val < 1 {
+                return Some(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "max_output_tokens 必须大于 0",
+                ));
+            }
+        }
+    }
+
+    // 4. compact 模式下严格校验 model
+    if strict_model {
+        let model = body_json
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim())
+            .unwrap_or("");
+        if model.is_empty() {
+            return Some(error_response(
+                StatusCode::BAD_REQUEST,
+                "Missing required parameter: model",
+            ));
+        }
+        if !super::SUPPORTED_MODELS.contains(&model) {
+            return Some(error_response(
+                StatusCode::BAD_REQUEST,
+                &format!("Unsupported model: {}", model),
+            ));
+        }
+    }
+
+    None
 }
 
 /// GET /v1/models
@@ -64,6 +182,7 @@ async fn proxy_request(
     body: Bytes,
     endpoint: &str,
     translate: bool,
+    mode: ProxyMode,
 ) -> Response {
     let start = Instant::now();
     let max_retries = state.settings.read().await.max_retries;
@@ -101,12 +220,30 @@ async fn proxy_request(
 
     let mut exclude_set: HashSet<i64> = HashSet::new();
     let mut last_error = String::new();
+    // 429 重试单独计数：与 codex2api Go 一致（默认 1，达上限即停止重试该状态）
+    let mut rate_limit_retries: i32 = 0;
+    const MAX_RATE_LIMIT_RETRIES: i32 = 1;
+    // 最后一次 429 的 body（用于重试耗尽后构造 usage_limit_reached 终态响应）
+    let mut last_429_body: Option<String> = None;
+
+    // 提前解析 session_id（用于 session affinity）
+    // 注意：这里传空 account_id，因为还没选择账号
+    let session_hint = body_json
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            headers
+                .get("x-session-id")
+                .and_then(|v| v.to_str().ok())
+        })
+        .unwrap_or("")
+        .to_string();
 
     for _attempt in 0..=max_retries {
-        // 选择账号
+        // 选择账号（带 session affinity）
         let account = match state
             .scheduler
-            .wait_for_available(&exclude_set, Duration::from_secs(30))
+            .wait_for_available_with_session(&session_hint, &exclude_set, Duration::from_secs(30))
             .await
         {
             Some(acc) => acc,
@@ -145,7 +282,10 @@ async fn proxy_request(
         if upstream_body.get("instructions").is_none() {
             upstream_body["instructions"] = Value::String(String::new());
         }
-        upstream_body["stream"] = Value::Bool(true);
+        // compact 模式下保留客户端原始 stream 取值（透传），其它模式强制流式
+        if mode != ProxyMode::Compact {
+            upstream_body["stream"] = Value::Bool(true);
+        }
         upstream_body["store"] = Value::Bool(false);
         if upstream_body.get("include").is_none() {
             upstream_body["include"] =
@@ -174,25 +314,30 @@ async fn proxy_request(
 
         // ── 构建 HTTP 请求 ──
 
-        let upstream_url = format!("{}/responses", super::UPSTREAM_BASE);
-        let ua = crate::proxy::useragent::ua_for_account(&account_id_str);
-        let version = crate::proxy::useragent::version_from_ua(ua);
-        let (stainless_os, stainless_arch) = crate::proxy::useragent::platform_from_ua(ua);
+        let upstream_url = format!("{}{}", super::UPSTREAM_BASE, mode.upstream_path());
+        let device_profile = crate::proxy::useragent::DeviceProfile::from_config(&state.config, &account_id_str);
+
         let client = get_or_create_client(&state, &proxy_url);
+
+        let accept_header = if mode == ProxyMode::Compact {
+            "application/json"
+        } else {
+            "text/event-stream"
+        };
 
         let mut req = client
             .post(&upstream_url)
             .header("Authorization", format!("Bearer {}", access_token))
             .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream")
-            .header("User-Agent", ua)
-            .header("Version", version)
+            .header("Accept", accept_header)
+            .header("User-Agent", &device_profile.user_agent)
+            .header("Version", &device_profile.package_version)
             .header("Originator", super::ORIGINATOR)
             .header("Connection", "Keep-Alive")
-            .header("X-Stainless-Package-Version", version)
-            .header("X-Stainless-Runtime-Version", version)
-            .header("X-Stainless-Os", stainless_os)
-            .header("X-Stainless-Arch", stainless_arch)
+            .header("X-Stainless-Package-Version", &device_profile.package_version)
+            .header("X-Stainless-Runtime-Version", &device_profile.runtime_version)
+            .header("X-Stainless-Os", &device_profile.os)
+            .header("X-Stainless-Arch", &device_profile.arch)
             .json(&upstream_body)
             .timeout(Duration::from_secs(600));
 
@@ -234,6 +379,21 @@ async fn proxy_request(
                         latency_ms,
                         "{msg}"
                     );
+
+                    // ── compact 模式：一次性读取 JSON 透传 ──
+                    if mode == ProxyMode::Compact {
+                        return collect_compact_response(
+                            resp,
+                            state.clone(),
+                            account.db_id,
+                            endpoint,
+                            &model,
+                            &account_email,
+                            &reasoning_effort,
+                            start,
+                        )
+                        .await;
+                    }
 
                     if is_stream || translate {
                         // Peek 第一个 chunk — 在返回 SSE 响应之前验证上游是否真正开始输出
@@ -310,6 +470,7 @@ async fn proxy_request(
 
                 // 输出上游错误日志（401 → ERROR 红色，其余 → WARN 黄色）
                 let err_body_short: String = error_body.chars().take(500).collect();
+                let upstream_kind = upstream_error_kind(status_u16, &error_body);
                 if status_u16 == 401 {
                     error!(
                         endpoint,
@@ -317,6 +478,7 @@ async fn proxy_request(
                         account_id = account.db_id,
                         email = %account_email,
                         attempt = _attempt + 1,
+                        kind = %upstream_kind,
                         body = %err_body_short,
                         "401 ← 上游返回错误"
                     );
@@ -327,6 +489,7 @@ async fn proxy_request(
                         account_id = account.db_id,
                         email = %account_email,
                         attempt = _attempt + 1,
+                        kind = %upstream_kind,
                         body = %err_body_short,
                         "{status_u16} ← 上游返回错误"
                     );
@@ -340,15 +503,24 @@ async fn proxy_request(
                     0, &reasoning_effort, "",
                 ).await;
 
+                let err_kind = &upstream_kind;
                 match status_u16 {
                     401 => {
+                        // missing_scope 401 不算账号问题（API key scope 不足），保留在号池
+                        if is_missing_scope_unauthorized(&error_body) {
+                            warn!(
+                                account_id = account.db_id,
+                                "401 missing_scope，保留账号，不重试"
+                            );
+                            return error_response(StatusCode::UNAUTHORIZED, &error_body);
+                        }
                         account.report_failure(FailureType::Unauthorized);
                         // 检查是否开启自动清理 401 账号
                         let auto_clean = state.db_settings_cache.read()
                             .map(|s| s.auto_clean_unauthorized)
                             .unwrap_or(false);
                         if auto_clean {
-                            warn!(account_id = account.db_id, "账号 401，自动清理");
+                            warn!(account_id = account.db_id, kind = %err_kind, "账号 401，自动清理");
                             let db = state.db();
                             let aid = account.db_id;
                             tokio::spawn(async move {
@@ -362,12 +534,46 @@ async fn proxy_request(
                             tokio::spawn(async move {
                                 let _ = crate::db::queries::update_account_cooldown(&db, aid, chrono::Utc::now().timestamp() + 6 * 3600, "banned_401").await;
                             });
-                            warn!(account_id = account.db_id, "账号 401 banned");
+                            warn!(account_id = account.db_id, kind = %err_kind, "账号 401 banned");
                         }
                         exclude_set.insert(account.db_id);
                         last_error = format!("401: {}", error_body);
                     }
+                    402 | 403 => {
+                        // 工作区停用（deactivated_workspace）→ 长冷却 24h；其他 4xx 不重试直接透传
+                        if is_deactivated_workspace_error(&error_body) {
+                            account.report_failure(FailureType::Other);
+                            state
+                                .scheduler
+                                .mark_cooldown(&account, "deactivated_workspace", 24 * 3600);
+                            let db = state.db();
+                            let aid = account.db_id;
+                            let until = chrono::Utc::now().timestamp() + 24 * 3600;
+                            tokio::spawn(async move {
+                                let _ = crate::db::queries::update_account_cooldown(
+                                    &db,
+                                    aid,
+                                    until,
+                                    "deactivated_workspace",
+                                )
+                                .await;
+                            });
+                            warn!(
+                                account_id = account.db_id,
+                                status = status_u16,
+                                "账号工作区已停用，长冷却 24h"
+                            );
+                            return error_response(status, &error_body);
+                        }
+                        // 其他 402/403（payment_required/forbidden）短冷却 30min 但不在本次重试
+                        account.report_failure(FailureType::Other);
+                        state.scheduler.mark_cooldown(&account, "payment_required", 30 * 60);
+                        state.scheduler.recompute_health(&account);
+                        return error_response(status, &error_body);
+                    }
                     429 => {
+                        // 记录最新 429 body — 重试耗尽时用于构造 usage_limit_reached 终态响应
+                        last_429_body = Some(error_body.clone());
                         account.report_failure(FailureType::RateLimited);
                         // 首次 429 时记录 resets_at（上游用量重置时间）
                         if account.resets_at.load(std::sync::atomic::Ordering::Relaxed) == 0 {
@@ -411,6 +617,11 @@ async fn proxy_request(
                         }
                         exclude_set.insert(account.db_id);
                         last_error = format!("429: {}", error_body);
+                        rate_limit_retries += 1;
+                        // 429 重试预算独立：超过即跳出，进入最终响应（usage_limit_reached → 503）
+                        if rate_limit_retries > MAX_RATE_LIMIT_RETRIES {
+                            break;
+                        }
                     }
                     500..=599 => {
                         account.report_failure(FailureType::ServerError);
@@ -459,6 +670,13 @@ async fn proxy_request(
         }
     }
 
+    // 重试耗尽：若最后一次失败为 429 usage_limit_reached → 改写为 503 终态错误（携带 plan / resets_at / Retry-After）
+    if let Some(body) = &last_429_body {
+        if let Some(details) = parse_usage_limit_details(body) {
+            return final_usage_limit_response(&details);
+        }
+    }
+
     error_response(
         StatusCode::BAD_GATEWAY,
         &format!("重试耗尽: {}", last_error),
@@ -482,6 +700,17 @@ enum PeekResult {
 /// 参照 Go 项目 openai_responses_handlers.go:197-244
 /// 在返回 SSE 响应之前验证上游是否真正开始输出数据
 async fn peek_first_chunk(
+    stream: &mut (impl Stream<Item = Result<Bytes, reqwest::Error>> + Unpin),
+) -> PeekResult {
+    // 添加 30 秒超时保护，防止无限等待
+    match tokio::time::timeout(Duration::from_secs(30), peek_first_chunk_inner(stream)).await {
+        Ok(result) => result,
+        Err(_) => PeekResult::NetworkError("peek timeout after 30s".to_string()),
+    }
+}
+
+/// 内部 peek 实现（无超时）
+async fn peek_first_chunk_inner(
     stream: &mut (impl Stream<Item = Result<Bytes, reqwest::Error>> + Unpin),
 ) -> PeekResult {
     // 读取第一个 chunk（可能需要多个 chunk 才能凑齐一个完整 SSE 事件）
@@ -666,6 +895,15 @@ async fn stream_response_with_tracking(
             // 客户端断连 → 499
             let u = translator.usage.clone().unwrap_or_else(|| translator.estimate_tokens_on_break());
             (u, 499)
+        } else if translator.failed {
+            // 上游显式 response.failed → 用 payload 中的 status_code 取代默认 200
+            // 移植自 codex2api 提交 285f209 fix(proxy): classify response failed streams
+            let status = translator
+                .classify_failure()
+                .map(|(code, _kind, _msg)| code)
+                .unwrap_or(500);
+            let u = translator.usage.clone().unwrap_or_else(|| translator.estimate_tokens_on_break());
+            (u, status)
         } else if translator.completed && translator.usage.is_some() {
             // 完整完成 → 200
             (translator.usage.clone().unwrap(), 200)
@@ -704,6 +942,99 @@ async fn stream_response_with_tracking(
         .header("Connection", "keep-alive")
         .header("X-Accel-Buffering", "no")
         .body(body)
+        .unwrap()
+}
+
+/// compact 模式 — 一次性读取上游 JSON 响应并透传，提取 usage 用于日志
+async fn collect_compact_response(
+    resp: reqwest::Response,
+    state: Arc<AppState>,
+    account_id: i64,
+    endpoint: &str,
+    model: &str,
+    email: &str,
+    reasoning_effort: &str,
+    request_start: Instant,
+) -> Response {
+    // 读取上游响应体
+    let body_bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(account_id, error = %e, "compact 读取上游响应体失败");
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                &format!("读取上游响应失败: {}", e),
+            );
+        }
+    };
+
+    let duration = request_start.elapsed().as_millis() as i64;
+
+    // 提取 usage（用于日志和成本计算）
+    let usage = match serde_json::from_slice::<Value>(&body_bytes) {
+        Ok(v) => UsageInfo {
+            input_tokens: v
+                .pointer("/usage/input_tokens")
+                .and_then(|x| x.as_i64())
+                .unwrap_or(0),
+            output_tokens: v
+                .pointer("/usage/output_tokens")
+                .and_then(|x| x.as_i64())
+                .unwrap_or(0),
+            reasoning_tokens: v
+                .pointer("/usage/output_tokens_details/reasoning_tokens")
+                .and_then(|x| x.as_i64())
+                .unwrap_or(0),
+            cached_tokens: v
+                .pointer("/usage/input_tokens_details/cached_tokens")
+                .and_then(|x| x.as_i64())
+                .unwrap_or(0),
+            total_tokens: v
+                .pointer("/usage/total_tokens")
+                .and_then(|x| x.as_i64())
+                .unwrap_or(0),
+        },
+        Err(_) => UsageInfo {
+            input_tokens: 0,
+            output_tokens: 0,
+            reasoning_tokens: 0,
+            cached_tokens: 0,
+            total_tokens: 0,
+        },
+    };
+
+    let service_tier = serde_json::from_slice::<Value>(&body_bytes)
+        .ok()
+        .and_then(|v| v.get("service_tier").and_then(|x| x.as_str()).map(String::from))
+        .unwrap_or_default();
+
+    let endpoint = endpoint.to_string();
+    let model = model.to_string();
+    let email = email.to_string();
+    let effort = reasoning_effort.to_string();
+
+    tokio::spawn(async move {
+        send_usage_log(
+            &state,
+            account_id,
+            &endpoint,
+            &model,
+            200,
+            duration,
+            false,
+            &email,
+            &usage,
+            0,
+            &effort,
+            &service_tier,
+        )
+        .await;
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "application/json")
+        .body(Body::from(body_bytes))
         .unwrap()
 }
 
@@ -751,6 +1082,16 @@ async fn collect_sync_response(
     let usage = translator.usage.clone().unwrap_or_else(|| translator.estimate_tokens_on_break());
     let service_tier = translator.service_tier.clone();
 
+    // 移植自 codex2api 提交 285f209：sync 模式下若上游 response.failed，按真实状态码记录
+    let log_status: i64 = if translator.failed {
+        translator
+            .classify_failure()
+            .map(|(code, _kind, _msg)| code)
+            .unwrap_or(500)
+    } else {
+        200
+    };
+
     let endpoint = endpoint.to_string();
     let model = model.to_string();
     let email = email.to_string();
@@ -766,7 +1107,7 @@ async fn collect_sync_response(
         async move {
             send_usage_log(
                 &state, account_id, &endpoint, &model,
-                200, duration, false, &email,
+                log_status, duration, false, &email,
                 &usage, first_token_ms, &effort, &service_tier,
             ).await;
         }
@@ -821,8 +1162,8 @@ pub(crate) fn get_or_create_client(state: &AppState, account_proxy: &str) -> req
 
     // 创建新 Client，优化连接池参数
     let mut builder = reqwest::Client::builder()
-        .pool_max_idle_per_host(20)
-        .pool_idle_timeout(Duration::from_secs(300))
+        .pool_max_idle_per_host(50)  // 20 → 50，提升连接复用率
+        .pool_idle_timeout(Duration::from_secs(600))  // 300 → 600，保持连接更久
         .connect_timeout(Duration::from_secs(10))
         .tcp_keepalive(Duration::from_secs(60))
         .tcp_nodelay(true);
@@ -860,6 +1201,15 @@ pub(crate) fn parse_rate_limit_cooldown(
         if let Some(secs) = body.get("resets_in_seconds").and_then(|v| v.as_i64()) {
             return secs.max(60);
         }
+        // /error/resets_in_seconds — Codex 实际返回路径
+        if let Some(secs) = body
+            .pointer("/error/resets_in_seconds")
+            .and_then(|v| v.as_i64())
+        {
+            if secs > 0 {
+                return secs.max(60);
+            }
+        }
         // resets_at ISO 时间（顶层）
         if let Some(at) = body.get("resets_at").and_then(|v| v.as_str()) {
             if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(at) {
@@ -874,6 +1224,11 @@ pub(crate) fn parse_rate_limit_cooldown(
                 return (ts - now).max(60);
             }
         }
+    }
+
+    // 模型容量错误 → 短时冷却（5min）— 不应触发长时间限流
+    if is_codex_model_capacity_error(error_body) {
+        return 5 * 60;
     }
 
     // 检查 dual-window headers
@@ -1105,6 +1460,16 @@ async fn send_usage_log(
     service_tier: &str,
 ) {
     use crate::db::models::UsageLog;
+
+    // 计算成本
+    let cost_breakdown = crate::billing::calculate_cost(
+        model,
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cached_tokens,
+        service_tier,
+    );
+
     let log = UsageLog {
         id: 0,
         account_id,
@@ -1124,7 +1489,349 @@ async fn send_usage_log(
         stream,
         service_tier: service_tier.to_string(),
         account_email: email.to_string(),
+        cost: cost_breakdown.total_cost,
         created_at: String::new(),
     };
     let _ = state.log_sender.send(log).await;
+}
+
+// ─── 上游错误分类与终态响应辅助 ───
+//
+// 对齐 codex2api/proxy/handler.go 中的 upstreamErrorKind / isMissingScopeUnauthorized /
+// IsDeactivatedWorkspaceError / parseUsageLimitDetails / isCodexModelCapacityError /
+// sendFinalUpstreamError。这些函数让 rs 与 Go 在 401 missing_scope、402/403
+// deactivated_workspace、429 usage_limit_reached 终态、模型容量短冷却等关键路径上
+// 行为一致。
+
+/// 上游错误统一分类标签（用于日志，与 Go `upstreamErrorKind` 同义）
+pub(crate) fn upstream_error_kind(status_code: u16, body: &str) -> &'static str {
+    match status_code {
+        429 => "rate_limited",
+        401 => "unauthorized",
+        402 | 403 => {
+            if is_deactivated_workspace_error(body) {
+                "deactivated_workspace"
+            } else {
+                "payment_required"
+            }
+        }
+        500 | 502 | 503 | 504 => "server",
+        s if s >= 400 => "client",
+        _ => "",
+    }
+}
+
+/// 工作区已停用错误：error.code == "deactivated_workspace" 或 body 含此关键字
+pub(crate) fn is_deactivated_workspace_error(body: &str) -> bool {
+    if let Ok(v) = serde_json::from_str::<Value>(body) {
+        for path in ["/detail/code", "/error/code", "/code"] {
+            if let Some(code) = v.pointer(path).and_then(|x| x.as_str()) {
+                if code.eq_ignore_ascii_case("deactivated_workspace") {
+                    return true;
+                }
+            }
+        }
+    }
+    body.to_ascii_lowercase().contains("deactivated_workspace")
+}
+
+/// 401 missing_scope：API Key 缺少 api.responses.write 权限，账号本身无问题
+pub(crate) fn is_missing_scope_unauthorized(body: &str) -> bool {
+    let v: Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let code = v
+        .pointer("/error/code")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if code != "missing_scope" {
+        return false;
+    }
+    let msg = v
+        .pointer("/error/message")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if msg.contains("api.responses.write") {
+        return true;
+    }
+    msg.contains("scope")
+}
+
+/// Codex 模型容量错误（"selected model is at capacity"）— 应短冷却（5min）而不是按限流处理
+pub(crate) fn is_codex_model_capacity_error(body: &str) -> bool {
+    let candidates: [String; 3] = {
+        let v = serde_json::from_str::<Value>(body).ok();
+        let err_msg = v
+            .as_ref()
+            .and_then(|x| x.pointer("/error/message"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        let msg = v
+            .as_ref()
+            .and_then(|x| x.get("message"))
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        [err_msg, msg, body.to_string()]
+    };
+    for c in &candidates {
+        let lower = c.trim().to_ascii_lowercase();
+        if lower.is_empty() {
+            continue;
+        }
+        if lower.contains("selected model is at capacity")
+            || lower.contains("model is at capacity. please try a different model")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// usage_limit_reached 详情（plan_type / resets_at / resets_in_seconds / message）
+#[derive(Debug, Clone, Default)]
+pub(crate) struct UsageLimitDetails {
+    pub message: String,
+    pub plan_type: String,
+    pub resets_at: i64,
+    pub resets_in_seconds: i64,
+}
+
+/// 解析 429 body 中的 usage_limit_reached 细节；非 usage_limit 返回 None
+pub(crate) fn parse_usage_limit_details(body: &str) -> Option<UsageLimitDetails> {
+    if body.trim().is_empty() {
+        return None;
+    }
+    let v: Value = serde_json::from_str(body).ok()?;
+    let etype = v
+        .pointer("/error/type")
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
+    if etype != "usage_limit_reached" {
+        return None;
+    }
+    let message = v
+        .pointer("/error/message")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let plan_type = v
+        .pointer("/error/plan_type")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let resets_at = v
+        .pointer("/error/resets_at")
+        .and_then(|x| x.as_i64())
+        .unwrap_or(0);
+    let resets_in_seconds = v
+        .pointer("/error/resets_in_seconds")
+        .and_then(|x| x.as_i64())
+        .unwrap_or(0);
+    Some(UsageLimitDetails {
+        message,
+        plan_type,
+        resets_at,
+        resets_in_seconds,
+    })
+}
+
+/// 构造重试耗尽且最后一次为 usage_limit_reached 时的最终响应（503 + Retry-After）
+///
+/// 对齐 Go `sendFinalUpstreamError`：账号池整体额度耗尽时不应让客户端看到 429
+/// （这会让上层 SDK 误以为是单账号问题继续轮询），而是返回 503 终态。
+fn final_usage_limit_response(details: &UsageLimitDetails) -> Response {
+    let mut message = "账号池额度已耗尽，请稍后重试".to_string();
+    if !details.message.is_empty() {
+        message = format!("{}：{}", message, details.message);
+    }
+
+    let mut err_obj = serde_json::Map::new();
+    err_obj.insert("message".to_string(), Value::String(message));
+    err_obj.insert("type".to_string(), Value::String("server_error".to_string()));
+    err_obj.insert(
+        "code".to_string(),
+        Value::String("account_pool_usage_limit_reached".to_string()),
+    );
+    if !details.plan_type.is_empty() {
+        err_obj.insert(
+            "plan_type".to_string(),
+            Value::String(details.plan_type.clone()),
+        );
+    }
+    if details.resets_at != 0 {
+        err_obj.insert(
+            "resets_at".to_string(),
+            Value::Number(details.resets_at.into()),
+        );
+    }
+    if details.resets_in_seconds != 0 {
+        err_obj.insert(
+            "resets_in_seconds".to_string(),
+            Value::Number(details.resets_in_seconds.into()),
+        );
+    }
+
+    let payload = serde_json::json!({ "error": Value::Object(err_obj) });
+    let body_bytes = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+
+    let mut builder = Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header("Content-Type", "application/json");
+    if details.resets_in_seconds > 0 {
+        builder = builder.header("Retry-After", details.resets_in_seconds.to_string());
+    }
+    builder.body(Body::from(body_bytes)).unwrap()
+}
+
+// ─── 单元测试 ───
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upstream_error_kind_basic() {
+        assert_eq!(upstream_error_kind(429, ""), "rate_limited");
+        assert_eq!(upstream_error_kind(401, ""), "unauthorized");
+        assert_eq!(upstream_error_kind(403, ""), "payment_required");
+        assert_eq!(upstream_error_kind(500, ""), "server");
+        assert_eq!(upstream_error_kind(502, ""), "server");
+        assert_eq!(upstream_error_kind(400, ""), "client");
+        assert_eq!(upstream_error_kind(200, ""), "");
+    }
+
+    #[test]
+    fn upstream_error_kind_deactivated() {
+        let body = r#"{"error":{"code":"deactivated_workspace","message":"workspace gone"}}"#;
+        assert_eq!(upstream_error_kind(402, body), "deactivated_workspace");
+        assert_eq!(upstream_error_kind(403, body), "deactivated_workspace");
+    }
+
+    #[test]
+    fn deactivated_workspace_detection_paths() {
+        // error.code 路径
+        assert!(is_deactivated_workspace_error(
+            r#"{"error":{"code":"deactivated_workspace"}}"#
+        ));
+        // detail.code 路径
+        assert!(is_deactivated_workspace_error(
+            r#"{"detail":{"code":"deactivated_workspace","message":"x"}}"#
+        ));
+        // 顶层 code
+        assert!(is_deactivated_workspace_error(
+            r#"{"code":"deactivated_workspace"}"#
+        ));
+        // 大小写不敏感
+        assert!(is_deactivated_workspace_error(
+            r#"{"error":{"code":"DEACTIVATED_WORKSPACE"}}"#
+        ));
+        // 兜底：纯文本含关键字
+        assert!(is_deactivated_workspace_error(
+            "Workspace status: deactivated_workspace"
+        ));
+        // 反例
+        assert!(!is_deactivated_workspace_error(
+            r#"{"error":{"code":"rate_limit_exceeded"}}"#
+        ));
+        assert!(!is_deactivated_workspace_error(""));
+    }
+
+    #[test]
+    fn missing_scope_detection() {
+        assert!(is_missing_scope_unauthorized(
+            r#"{"error":{"code":"missing_scope","message":"missing scope: api.responses.write"}}"#
+        ));
+        // scope 关键字也算
+        assert!(is_missing_scope_unauthorized(
+            r#"{"error":{"code":"missing_scope","message":"required scope not present"}}"#
+        ));
+        // code 必须严格匹配
+        assert!(!is_missing_scope_unauthorized(
+            r#"{"error":{"code":"invalid_token","message":"missing scope"}}"#
+        ));
+        // message 不提 scope 不算（Go 行为）
+        assert!(!is_missing_scope_unauthorized(
+            r#"{"error":{"code":"missing_scope","message":"something else"}}"#
+        ));
+        assert!(!is_missing_scope_unauthorized(""));
+    }
+
+    #[test]
+    fn parse_usage_limit_details_full() {
+        let body = r#"{
+            "error": {
+                "type": "usage_limit_reached",
+                "message": "你已用完本月配额",
+                "plan_type": "plus",
+                "resets_at": 1799999999,
+                "resets_in_seconds": 3600
+            }
+        }"#;
+        let d = parse_usage_limit_details(body).expect("usage_limit detected");
+        assert_eq!(d.plan_type, "plus");
+        assert_eq!(d.resets_at, 1799999999);
+        assert_eq!(d.resets_in_seconds, 3600);
+        assert!(d.message.contains("配额"));
+    }
+
+    #[test]
+    fn parse_usage_limit_details_rejects_non_usage_limit() {
+        let body = r#"{"error":{"type":"rate_limit_exceeded","message":"x"}}"#;
+        assert!(parse_usage_limit_details(body).is_none());
+        assert!(parse_usage_limit_details("").is_none());
+        assert!(parse_usage_limit_details("not json").is_none());
+    }
+
+    #[test]
+    fn model_capacity_detection() {
+        assert!(is_codex_model_capacity_error(
+            r#"{"error":{"message":"The selected model is at capacity"}}"#
+        ));
+        assert!(is_codex_model_capacity_error(
+            "Model is at capacity. Please try a different model."
+        ));
+        assert!(is_codex_model_capacity_error(
+            r#"{"message":"selected MODEL IS AT CAPACITY right now"}"#
+        ));
+        assert!(!is_codex_model_capacity_error("rate limit"));
+        assert!(!is_codex_model_capacity_error(""));
+    }
+
+    #[test]
+    fn final_usage_limit_response_shape() {
+        let d = UsageLimitDetails {
+            message: "configured limit reached".to_string(),
+            plan_type: "pro".to_string(),
+            resets_at: 1799999999,
+            resets_in_seconds: 7200,
+        };
+        let resp = final_usage_limit_response(&d);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let retry = resp
+            .headers()
+            .get("Retry-After")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(retry, "7200");
+        let ct = resp
+            .headers()
+            .get("Content-Type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(ct.contains("application/json"));
+    }
+
+    #[test]
+    fn final_usage_limit_response_no_retry_after_when_missing() {
+        let d = UsageLimitDetails::default();
+        let resp = final_usage_limit_response(&d);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.headers().get("Retry-After").is_none());
+    }
 }

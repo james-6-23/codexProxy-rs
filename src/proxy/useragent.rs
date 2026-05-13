@@ -173,47 +173,6 @@ fn fnv32a(data: &[u8]) -> u32 {
 // opencode）。命中后上游可放行额外能力（如 reasoning_effort=xhigh），并允许
 // 透传下游 UA / Originator 而不是覆盖成兜底值。
 
-/// 官方 Codex 客户端 UA 前缀（含部分受信任第三方）
-const OFFICIAL_UA_PREFIXES: &[&str] = &[
-    "codex_cli_rs/",
-    "codex_vscode/",
-    "codex_app/",
-    "codex_chatgpt_desktop/",
-    "codex_atlas/",
-    "codex_exec/",
-    "codex_sdk_ts/",
-    "codex ",
-    "opencode/",
-];
-
-/// 官方 Codex Originator 前缀（ChatGPT 后端接受的一等公民）
-const OFFICIAL_ORIGINATOR_PREFIXES: &[&str] = &["codex_", "codex ", "opencode"];
-
-/// 判断下游 UA / Originator 是否来自官方 / 受信任的 Codex 客户端
-///
-/// 与 Go `IsCodexOfficialClientByHeaders` 行为一致：两个值都做 lower+trim，
-/// 任一前缀命中（prefix 或 contains）即视为官方。
-pub fn is_codex_official_client_by_headers(user_agent: &str, originator: &str) -> bool {
-    match_codex_prefixes(user_agent, OFFICIAL_UA_PREFIXES)
-        || match_codex_prefixes(originator, OFFICIAL_ORIGINATOR_PREFIXES)
-}
-
-fn match_codex_prefixes(value: &str, prefixes: &[&str]) -> bool {
-    let v = value.trim().to_ascii_lowercase();
-    if v.is_empty() {
-        return false;
-    }
-    for prefix in prefixes {
-        let p = prefix.trim().to_ascii_lowercase();
-        if p.is_empty() {
-            continue;
-        }
-        if v.starts_with(&p) || v.contains(&p) {
-            return true;
-        }
-    }
-    false
-}
 
 #[cfg(test)]
 mod tests {
@@ -249,25 +208,5 @@ mod tests {
             version_from_ua("codex_cli_rs/0.129.0-alpha.4 (Ubuntu 24.04; x86_64) kitty/0.35.2"),
             "0.129.0-alpha.4"
         );
-    }
-
-    #[test]
-    fn test_is_codex_official_client_by_headers() {
-        // 通过 UA 命中
-        assert!(is_codex_official_client_by_headers(
-            "codex_cli_rs/0.128.0 (Mac OS 15.5.0; arm64) Apple_Terminal/464",
-            "",
-        ));
-        // 通过 Originator 命中
-        assert!(is_codex_official_client_by_headers("", "codex_cli_rs"));
-        assert!(is_codex_official_client_by_headers("", "opencode"));
-        // 第三方 SDK
-        assert!(is_codex_official_client_by_headers(
-            "codex_vscode/1.2.3", ""
-        ));
-        // 未命中
-        assert!(!is_codex_official_client_by_headers("", ""));
-        assert!(!is_codex_official_client_by_headers("curl/8.0", ""));
-        assert!(!is_codex_official_client_by_headers("", "random-tool"));
     }
 }

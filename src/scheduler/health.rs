@@ -16,8 +16,8 @@ impl Scheduler {
         // 判断 tier + 动态并发
         let (tier, concurrency) = if account.last_unauthorized_at.load(Ordering::Relaxed) > 0 {
             let elapsed = now - account.last_unauthorized_at.load(Ordering::Relaxed);
-            if elapsed < 21600 {
-                // 6 小时内 401 → banned
+            if elapsed < 300 {
+                // 5 分钟内 401 → banned（对齐 Go 的 5min cooldown）
                 (TIER_BANNED, 0)
             } else if score_f > 80.0 {
                 (TIER_HEALTHY, max_c)
@@ -70,8 +70,9 @@ impl Scheduler {
         account.health_tier.store(TIER_BANNED, Ordering::Relaxed);
         account.dynamic_concurrency_limit.store(0, Ordering::Relaxed);
 
-        // 冷却 6 小时
-        let until = now + 6 * 3600;
+        // 冷却 5 分钟（对齐 codex2api Go proxy/handler.go:2835
+        //  MarkCooldown(account, 5*time.Minute, "unauthorized")）
+        let until = now + 5 * 60;
         account.cooldown_until.store(until, Ordering::Relaxed);
     }
 

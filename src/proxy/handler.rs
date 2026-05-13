@@ -532,7 +532,7 @@ async fn proxy_request(
                             let db = state.db();
                             let aid = account.db_id;
                             tokio::spawn(async move {
-                                let _ = crate::db::queries::update_account_cooldown(&db, aid, chrono::Utc::now().timestamp() + 6 * 3600, "banned_401").await;
+                                let _ = crate::db::queries::update_account_cooldown(&db, aid, chrono::Utc::now().timestamp() + 5 * 60, "banned_401").await;
                             });
                             warn!(account_id = account.db_id, kind = %err_kind, "账号 401 banned");
                         }
